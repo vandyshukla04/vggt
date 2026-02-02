@@ -242,26 +242,32 @@ def run_tracking(
 
     print("\n=== Running Tracking Pipeline ===")
 
+    def maybe_squeeze_batch(arr):
+        """Remove batch dimension if it exists and equals 1."""
+        if arr.ndim > 0 and arr.shape[0] == 1:
+            return arr.squeeze(0)
+        return arr
+
     # Convert predictions to numpy
     if isinstance(predictions["extrinsic"], torch.Tensor):
-        extrinsics = predictions["extrinsic"].cpu().numpy().squeeze(0)
-        intrinsics = predictions["intrinsic"].cpu().numpy().squeeze(0)
-        depth = predictions["depth"].cpu().numpy().squeeze(0)
-        depth_conf = predictions["depth_conf"].cpu().numpy().squeeze(0)
-        images = predictions["images"].cpu().numpy().squeeze(0)
+        extrinsics = maybe_squeeze_batch(predictions["extrinsic"].cpu().numpy())
+        intrinsics = maybe_squeeze_batch(predictions["intrinsic"].cpu().numpy())
+        depth = maybe_squeeze_batch(predictions["depth"].cpu().numpy())
+        depth_conf = maybe_squeeze_batch(predictions["depth_conf"].cpu().numpy())
+        images = maybe_squeeze_batch(predictions["images"].cpu().numpy())
     else:
-        extrinsics = predictions["extrinsic"].squeeze(0) if predictions["extrinsic"].ndim > 3 else predictions["extrinsic"]
-        intrinsics = predictions["intrinsic"].squeeze(0) if predictions["intrinsic"].ndim > 3 else predictions["intrinsic"]
-        depth = predictions["depth"].squeeze(0) if predictions["depth"].ndim > 3 else predictions["depth"]
-        depth_conf = predictions["depth_conf"].squeeze(0) if predictions["depth_conf"].ndim > 2 else predictions["depth_conf"]
-        images = predictions["images"].squeeze(0) if predictions["images"].ndim > 4 else predictions["images"]
+        extrinsics = maybe_squeeze_batch(predictions["extrinsic"])
+        intrinsics = maybe_squeeze_batch(predictions["intrinsic"])
+        depth = maybe_squeeze_batch(predictions["depth"])
+        depth_conf = maybe_squeeze_batch(predictions["depth_conf"])
+        images = maybe_squeeze_batch(predictions["images"])
 
     # Get world points
     if use_point_map and "world_points" in predictions:
         if isinstance(predictions["world_points"], torch.Tensor):
-            world_points = predictions["world_points"].cpu().numpy().squeeze(0)
+            world_points = maybe_squeeze_batch(predictions["world_points"].cpu().numpy())
         else:
-            world_points = predictions["world_points"].squeeze(0) if predictions["world_points"].ndim > 4 else predictions["world_points"]
+            world_points = maybe_squeeze_batch(predictions["world_points"])
     else:
         world_points = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics)
 
