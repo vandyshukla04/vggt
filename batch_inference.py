@@ -161,16 +161,23 @@ def save_predictions(
     torch.save(predictions_cpu, predictions_path)
     print(f"Saved predictions to {predictions_path}")
 
-    # Extract numpy arrays
-    images = predictions_cpu["images"].numpy().squeeze(0)  # (S, 3, H, W)
-    extrinsics = predictions_cpu["extrinsic"].numpy().squeeze(0)  # (S, 3, 4)
-    intrinsics = predictions_cpu["intrinsic"].numpy().squeeze(0)  # (S, 3, 3)
-    depth = predictions_cpu["depth"].numpy().squeeze(0)  # (S, H, W, 1)
-    depth_conf = predictions_cpu["depth_conf"].numpy().squeeze(0)  # (S, H, W)
+    # Helper to safely remove batch dimension
+    def maybe_squeeze_batch(arr):
+        """Remove batch dimension if it exists and equals 1."""
+        if arr.ndim > 0 and arr.shape[0] == 1:
+            return arr[0]
+        return arr
+
+    # Extract numpy arrays (handle both batched and unbatched tensors)
+    images = maybe_squeeze_batch(predictions_cpu["images"].numpy())  # (S, 3, H, W)
+    extrinsics = maybe_squeeze_batch(predictions_cpu["extrinsic"].numpy())  # (S, 3, 4)
+    intrinsics = maybe_squeeze_batch(predictions_cpu["intrinsic"].numpy())  # (S, 3, 3)
+    depth = maybe_squeeze_batch(predictions_cpu["depth"].numpy())  # (S, H, W, 1)
+    depth_conf = maybe_squeeze_batch(predictions_cpu["depth_conf"].numpy())  # (S, H, W)
 
     if use_point_map:
-        world_points = predictions_cpu["world_points"].numpy().squeeze(0)
-        conf = predictions_cpu["world_points_conf"].numpy().squeeze(0)
+        world_points = maybe_squeeze_batch(predictions_cpu["world_points"].numpy())
+        conf = maybe_squeeze_batch(predictions_cpu["world_points_conf"].numpy())
     else:
         world_points = unproject_depth_map_to_point_map(depth, extrinsics, intrinsics)
         conf = depth_conf
