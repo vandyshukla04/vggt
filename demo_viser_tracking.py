@@ -27,10 +27,16 @@ from datetime import datetime
 import numpy as np
 import torch
 from tqdm.auto import tqdm
-import viser
-import viser.transforms as viser_tf
 import cv2
 from scipy.optimize import linear_sum_assignment
+
+# viser is optional - only needed for visualization, not for tracking/export
+try:
+    import viser
+    import viser.transforms as viser_tf
+    HAS_VISER = True
+except ImportError:
+    HAS_VISER = False
 
 try:
     import matplotlib
@@ -1394,6 +1400,8 @@ def viser_wrapper_with_tracking(
     background_mode: bool = False,
 ):
     """Visualize predicted 3D points, camera poses, and tracked bounding boxes with viser."""
+    if not HAS_VISER:
+        raise ImportError("viser is required for visualization. Install with: pip install viser")
     print(f"Starting viser server on port {port}")
 
     server = viser.ViserServer(host="0.0.0.0", port=port)
