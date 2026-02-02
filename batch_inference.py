@@ -232,6 +232,7 @@ def run_tracking(
         ImprovedTracker,
         save_tracking_summary,
         save_trajectory_plots,
+        save_kitti_labels,
         project_bboxes_to_2d,
         parse_dji_logs,
         parse_dji_logs_with_gps,
@@ -309,14 +310,27 @@ def run_tracking(
 
     # Save tracking outputs
     if bounding_boxes and all_track_ids:
-        # Save tracking summary
-        save_tracking_summary(output_dir, bounding_boxes, all_track_ids)
+        frame_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
+
+        # Save extended tracking summary (with dimensions, rotations, velocities, 2D boxes)
+        save_tracking_summary(
+            output_dir, bounding_boxes, all_track_ids,
+            extrinsics=extrinsics,
+            intrinsics=intrinsics,
+            image_size=model_size
+        )
+
+        # Save KITTI format labels
+        save_kitti_labels(
+            output_dir, bounding_boxes,
+            extrinsics, intrinsics,
+            model_size, frame_names
+        )
 
         # Save trajectory plots
         save_trajectory_plots(output_dir, bounding_boxes, all_track_ids)
 
         # Project bboxes to 2D
-        frame_names = [os.path.splitext(os.path.basename(p))[0] for p in image_paths]
         project_bboxes_to_2d(
             bounding_boxes, original_images,
             extrinsics, intrinsics,

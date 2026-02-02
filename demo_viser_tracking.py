@@ -98,6 +98,7 @@ class BoundingBox3D:
         self.track_id = None
         self.persistent_instance_id = None
         self.mask = None  # 2D mask for tracking
+        self.velocity = None  # [vx, vy, vz] from Kalman filter
 
     def get_corners(self) -> np.ndarray:
         """Get 8 corner points of the bounding box"""
@@ -877,6 +878,12 @@ def compute_instance_bboxes(world_points: np.ndarray, masks_data: Dict[int, List
             bbox.track_id = tid
             bbox.mask = det['mask']
 
+            # Get velocity from Kalman filter
+            if tid >= 0 and tid in tracker.active_tracks:
+                bbox.velocity = tracker.active_tracks[tid].velocity.copy()
+            else:
+                bbox.velocity = np.zeros(3)
+
             # Apply ground plane alignment if gimbal data is available
             if ground_normal is not None:
                 bbox = align_bbox_to_ground_plane(bbox, ground_normal)
@@ -1060,9 +1067,58 @@ def project_bboxes_to_2d(bounding_boxes: List[List[BoundingBox3D]],
 # Output Functions
 # =============================================================================
 
+def compute_2d_bbox_from_3d(bbox: BoundingBox3D, extrinsic: np.ndarray,
+                            intrinsic: np.ndarray, image_size: Tuple[int, int]) -> List[float]:
+    """Project 3D bounding box to 2D and return [left, top, right, bottom].
+
+    Args:
+        bbox: BoundingBox3D object
+        extrinsic: (3, 4) world-to-camera transform
+        intrinsic: (3, 3) camera intrinsic matrix
+        image_size: (H, W) image dimensions
+
+    Returns:
+        [left, top, right, bottom] or [-1, -1, -1, -1] if invalid
+    """
+    corners_3d = bbox.get_corners()  # (8, 3)
+
+    # Transform to camera coordinates
+    corners_h = np.concatenate([corners_3d, np.ones((8, 1))], axis=1)
+    corners_cam = (extrinsic @ corners_h.T).T  # (8, 3)
+
+    # Check if in front of camera
+    if np.any(corners_cam[:, 2] <= 0):
+        return [-1.0, -1.0, -1.0, -1.0]
+
+    # Project to image
+    corners_2d_h = (intrinsic @ corners_cam.T).T
+    corners_2d = corners_2d_h[:, :2] / corners_2d_h[:, 2:3]
+
+    # Get bounding rectangle
+    h, w = image_size
+    x_min = float(max(0, np.min(corners_2d[:, 0])))
+    y_min = float(max(0, np.min(corners_2d[:, 1])))
+    x_max = float(min(w, np.max(corners_2d[:, 0])))
+    y_max = float(min(h, np.max(corners_2d[:, 1])))
+
+    return [x_min, y_min, x_max, y_max]
+
+
 def save_tracking_summary(output_dir: str, bounding_boxes: List[List[BoundingBox3D]],
-                          all_track_ids: List[int]):
-    """Save tracking summary to JSON."""
+                          all_track_ids: List[int],
+                          extrinsics: np.ndarray = None,
+                          intrinsics: np.ndarray = None,
+                          image_size: Tuple[int, int] = None):
+    """Save extended tracking summary to JSON with 3D and 2D information.
+
+    Args:
+        output_dir: Output directory
+        bounding_boxes: List of lists of BoundingBox3D per frame
+        all_track_ids: List of all unique track IDs
+        extrinsics: (S, 3, 4) camera extrinsics (optional, for 2D bbox)
+        intrinsics: (S, 3, 3) camera intrinsics (optional, for 2D bbox)
+        image_size: (H, W) image dimensions (optional, for 2D bbox)
+    """
     track_info = {}
 
     for frame_idx, frame_bboxes in enumerate(bounding_boxes):
@@ -1078,18 +1134,41 @@ def save_tracking_summary(output_dir: str, bounding_boxes: List[List[BoundingBox
                     'last_frame': frame_idx,
                     'frames': [],
                     'centers': [],
+                    'dimensions': [],
+                    'rotation_matrices': [],
+                    'velocities': [],
+                    'bbox_2d': [],
                     'confidences': [],
                 }
 
             track_info[tid]['last_frame'] = frame_idx
             track_info[tid]['frames'].append(frame_idx)
             track_info[tid]['centers'].append(bbox.center.tolist())
+            track_info[tid]['dimensions'].append(bbox.dimensions.tolist())
+            track_info[tid]['rotation_matrices'].append(bbox.rotation_matrix.tolist())
+            track_info[tid]['velocities'].append(
+                bbox.velocity.tolist() if bbox.velocity is not None else [0.0, 0.0, 0.0]
+            )
             track_info[tid]['confidences'].append(bbox.confidence)
+
+            # Compute 2D bounding box if camera parameters available
+            if extrinsics is not None and intrinsics is not None and image_size is not None:
+                bbox_2d = compute_2d_bbox_from_3d(
+                    bbox, extrinsics[frame_idx], intrinsics[frame_idx], image_size
+                )
+                track_info[tid]['bbox_2d'].append(bbox_2d)
+            else:
+                track_info[tid]['bbox_2d'].append([-1.0, -1.0, -1.0, -1.0])
 
     # Compute statistics
     for tid, info in track_info.items():
         info['length'] = len(info['frames'])
         info['avg_confidence'] = float(np.mean(info['confidences']))
+        # Compute average speed
+        velocities = np.array(info['velocities'])
+        speeds = np.linalg.norm(velocities, axis=1)
+        info['avg_speed'] = float(np.mean(speeds))
+        info['max_speed'] = float(np.max(speeds))
 
     summary = {
         'total_tracks': len(track_info),
@@ -1109,6 +1188,131 @@ def save_tracking_summary(output_dir: str, bounding_boxes: List[List[BoundingBox
     print(f"  Avg tracklet length: {summary['avg_tracklet_length']:.1f}")
 
     return track_info
+
+
+def compute_rotation_y(rotation_matrix: np.ndarray, camera_R: np.ndarray) -> float:
+    """Compute rotation around Y-axis in camera coordinates.
+
+    Args:
+        rotation_matrix: (3, 3) object rotation in world coordinates
+        camera_R: (3, 3) camera rotation matrix (from extrinsic)
+
+    Returns:
+        Rotation around Y-axis in radians [-pi, pi]
+    """
+    # Transform rotation to camera frame
+    R_cam = camera_R @ rotation_matrix
+    # Extract rotation around Y-axis (yaw) from rotation matrix
+    # For a rotation matrix, yaw can be extracted as atan2(R[0,2], R[2,2])
+    rotation_y = np.arctan2(R_cam[0, 2], R_cam[2, 2])
+    return rotation_y
+
+
+def compute_alpha(center_cam: np.ndarray, rotation_y: float) -> float:
+    """Compute observation angle alpha.
+
+    Alpha is the angle of the object relative to the camera viewing ray.
+    Alpha = rotation_y - arctan2(x, z)
+
+    Args:
+        center_cam: (3,) object center in camera coordinates
+        rotation_y: Rotation around Y-axis in radians
+
+    Returns:
+        Observation angle in radians [-pi, pi]
+    """
+    alpha = rotation_y - np.arctan2(center_cam[0], center_cam[2])
+    # Normalize to [-pi, pi]
+    while alpha > np.pi:
+        alpha -= 2 * np.pi
+    while alpha < -np.pi:
+        alpha += 2 * np.pi
+    return alpha
+
+
+def save_kitti_labels(output_dir: str, bounding_boxes: List[List[BoundingBox3D]],
+                      extrinsics: np.ndarray, intrinsics: np.ndarray,
+                      image_size: Tuple[int, int], frame_names: List[str]):
+    """Save tracking results in KITTI format (one file per frame).
+
+    KITTI format per line:
+    type truncated occluded alpha bbox_2d(4) dimensions(3) location(3) rotation_y score
+
+    - type: Object class name
+    - truncated: Float [0,1] indicating truncation (0 = not truncated)
+    - occluded: Integer {0,1,2,3} indicating occlusion (0 = fully visible)
+    - alpha: Observation angle [-pi, pi]
+    - bbox_2d: 2D bbox in pixels [left, top, right, bottom]
+    - dimensions: 3D dimensions [height, width, length] in meters
+    - location: 3D location [x, y, z] in camera coordinates
+    - rotation_y: Rotation around Y-axis in camera coords [-pi, pi]
+    - score: Confidence score
+
+    Args:
+        output_dir: Output directory
+        bounding_boxes: List of lists of BoundingBox3D per frame
+        extrinsics: (S, 3, 4) camera extrinsics (world-to-camera)
+        intrinsics: (S, 3, 3) camera intrinsics
+        image_size: (H, W) image dimensions
+        frame_names: List of frame names for file naming
+    """
+    kitti_dir = os.path.join(output_dir, "kitti_labels")
+    os.makedirs(kitti_dir, exist_ok=True)
+
+    print("\n=== Saving KITTI Labels ===")
+
+    for frame_idx, frame_bboxes in enumerate(bounding_boxes):
+        frame_name = frame_names[frame_idx] if frame_idx < len(frame_names) else f"{frame_idx:06d}"
+        label_path = os.path.join(kitti_dir, f"{frame_name}.txt")
+
+        ext = extrinsics[frame_idx]  # (3, 4)
+        K = intrinsics[frame_idx]  # (3, 3)
+        camera_R = ext[:3, :3]  # Rotation part
+
+        with open(label_path, 'w') as f:
+            for bbox in frame_bboxes:
+                if bbox.track_id is None or bbox.track_id < 0:
+                    continue
+
+                # Transform center to camera coordinates
+                center_world = np.append(bbox.center, 1.0)  # homogeneous
+                center_cam = ext @ center_world  # (3,)
+
+                # Skip if behind camera
+                if center_cam[2] <= 0:
+                    continue
+
+                # Compute rotation_y from rotation matrix in camera coords
+                rotation_y = compute_rotation_y(bbox.rotation_matrix, camera_R)
+
+                # Compute alpha (observation angle)
+                alpha = compute_alpha(center_cam, rotation_y)
+
+                # Compute 2D bounding box
+                bbox_2d = compute_2d_bbox_from_3d(bbox, ext, K, image_size)
+                if bbox_2d[0] < 0:  # Invalid projection
+                    continue
+
+                # KITTI dimensions order: height, width, length
+                # Our dimensions are [length, width, height]
+                l, w, h = bbox.dimensions
+                dim_h, dim_w, dim_l = h, w, l
+
+                # Write KITTI format line
+                # type truncated occluded alpha left top right bottom h w l x y z rotation_y score
+                line = (
+                    f"{bbox.class_name} "
+                    f"0.00 0 "  # truncated, occluded
+                    f"{alpha:.2f} "
+                    f"{bbox_2d[0]:.2f} {bbox_2d[1]:.2f} {bbox_2d[2]:.2f} {bbox_2d[3]:.2f} "
+                    f"{dim_h:.2f} {dim_w:.2f} {dim_l:.2f} "
+                    f"{center_cam[0]:.2f} {center_cam[1]:.2f} {center_cam[2]:.2f} "
+                    f"{rotation_y:.2f} "
+                    f"{bbox.confidence:.2f}\n"
+                )
+                f.write(line)
+
+    print(f"Saved KITTI labels to {kitti_dir}")
 
 
 def save_trajectory_plots(output_dir: str, bounding_boxes: List[List[BoundingBox3D]],

@@ -35,6 +35,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
 from vggt.utils.export import load_cameras_json, load_depth_maps
 
+try:
+    import cv2
+    HAS_CV2 = True
+except ImportError:
+    HAS_CV2 = False
+
 
 # Color palette for track visualization
 COLOR_PALETTE = [
@@ -56,6 +62,76 @@ def get_track_color(track_id: int, all_track_ids: List[int]) -> tuple:
     sorted_ids = sorted(all_track_ids)
     idx = sorted_ids.index(track_id) if track_id in sorted_ids else track_id
     return COLOR_PALETTE[idx % len(COLOR_PALETTE)]
+
+
+def speed_to_color(speed: float, min_speed: float, max_speed: float) -> tuple:
+    """Map speed to color: blue (slow) -> cyan -> green -> yellow -> red (fast).
+
+    Args:
+        speed: Current speed value
+        min_speed: Minimum speed in the dataset
+        max_speed: Maximum speed in the dataset
+
+    Returns:
+        RGB tuple with values in [0, 1]
+    """
+    if max_speed <= min_speed:
+        return (0.5, 0.5, 0.5)  # Gray if no variation
+
+    # Normalize speed to [0, 1]
+    t = (speed - min_speed) / (max_speed - min_speed)
+    t = np.clip(t, 0, 1)
+
+    # Color gradient: blue -> cyan -> green -> yellow -> red
+    if t < 0.25:
+        # Blue to Cyan
+        r, g, b = 0, t * 4, 1
+    elif t < 0.5:
+        # Cyan to Green
+        r, g, b = 0, 1, 1 - (t - 0.25) * 4
+    elif t < 0.75:
+        # Green to Yellow
+        r, g, b = (t - 0.5) * 4, 1, 0
+    else:
+        # Yellow to Red
+        r, g, b = 1, 1 - (t - 0.75) * 4, 0
+
+    return (r, g, b)
+
+
+def compute_bbox_corners(center: np.ndarray, dimensions: np.ndarray,
+                         rotation_matrix: np.ndarray) -> np.ndarray:
+    """Compute 8 corner points of a 3D bounding box.
+
+    Args:
+        center: (3,) center position
+        dimensions: (3,) [length, width, height]
+        rotation_matrix: (3, 3) rotation matrix
+
+    Returns:
+        (8, 3) array of corner positions
+    """
+    l, w, h = dimensions
+    corners_local = np.array([
+        [-l/2, -w/2, -h/2],
+        [+l/2, -w/2, -h/2],
+        [+l/2, +w/2, -h/2],
+        [-l/2, +w/2, -h/2],
+        [-l/2, -w/2, +h/2],
+        [+l/2, -w/2, +h/2],
+        [+l/2, +w/2, +h/2],
+        [-l/2, +w/2, +h/2],
+    ])
+    corners_world = (rotation_matrix @ corners_local.T).T + center
+    return corners_world
+
+
+# Bounding box edge indices for wireframe
+BBOX_EDGES = [
+    (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
+    (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
+    (0, 4), (1, 5), (2, 6), (3, 7),  # Vertical edges
+]
 
 
 def load_predictions(output_dir: str) -> dict:
@@ -176,6 +252,8 @@ def visualize_with_viser(
     # Build GUI
     gui_show_frames = server.gui.add_checkbox("Show Cameras", initial_value=True)
     gui_show_tracks = server.gui.add_checkbox("Show Track Trajectories", initial_value=True)
+    gui_show_bboxes = server.gui.add_checkbox("Show 3D Bounding Boxes", initial_value=False)
+    gui_speed_color = server.gui.add_checkbox("Speed Color Coding", initial_value=False)
     gui_points_conf = server.gui.add_slider(
         "Confidence Percent", min=0, max=100, step=0.1, initial_value=init_conf_threshold
     )
@@ -183,6 +261,7 @@ def visualize_with_viser(
         "Frame", min=-1, max=S-1, step=1, initial_value=-1
     )
     server.gui.add_markdown("*Frame -1 = All frames*")
+    server.gui.add_markdown("**Speed Legend**: Blue=Slow, Red=Fast")
 
     # Create initial point cloud
     init_threshold_val = np.percentile(conf_flat, init_conf_threshold)
@@ -198,6 +277,22 @@ def visualize_with_viser(
     frames: List[viser.FrameHandle] = []
     frustums: List[viser.CameraFrustumHandle] = []
     track_handles = []
+    bbox_handles = []
+
+    # Precompute speed statistics for color mapping
+    min_speed, max_speed = 0.0, 1.0
+    if tracking_data is not None:
+        all_speeds = []
+        for track_info in tracking_data.get("tracks", {}).values():
+            velocities = track_info.get("velocities", [])
+            for vel in velocities:
+                speed = np.linalg.norm(vel)
+                all_speeds.append(speed)
+        if all_speeds:
+            min_speed = np.min(all_speeds)
+            max_speed = np.max(all_speeds)
+            if max_speed <= min_speed:
+                max_speed = min_speed + 1e-6
 
     def visualize_frames():
         for f in frames:
@@ -271,35 +366,125 @@ def visualize_with_viser(
 
         tracks = tracking_data.get("tracks", {})
         all_track_ids = [int(tid) for tid in tracks.keys()]
+        use_speed_color = gui_speed_color.value
 
         for tid_str, track_info in tracks.items():
             tid = int(tid_str)
             centers = np.array(track_info["centers"]) - scene_center
+            velocities = track_info.get("velocities", [[0, 0, 0]] * len(centers))
 
             if len(centers) < 2:
                 continue
 
-            color = get_track_color(tid, all_track_ids)
+            if use_speed_color and len(velocities) >= len(centers) - 1:
+                # Draw segments with speed-based colors
+                for i in range(len(centers) - 1):
+                    vel = velocities[i] if i < len(velocities) else [0, 0, 0]
+                    speed = np.linalg.norm(vel)
+                    color = speed_to_color(speed, min_speed, max_speed)
 
-            # Draw trajectory as spline
+                    try:
+                        segment = server.scene.add_spline_catmull_rom(
+                            f"track_{tid}_seg_{i}",
+                            positions=np.array([centers[i], centers[i + 1]]),
+                            color=color,
+                        )
+                        track_handles.append(segment)
+                    except:
+                        pass
+
+                # Add start marker with speed color
+                start_speed = np.linalg.norm(velocities[0]) if velocities else 0
+                start_color = speed_to_color(start_speed, min_speed, max_speed)
+                try:
+                    marker = server.scene.add_icosphere(
+                        f"track_{tid}_start",
+                        radius=0.02,
+                        color=start_color,
+                        position=centers[0],
+                    )
+                    track_handles.append(marker)
+                except:
+                    pass
+            else:
+                # Use track ID-based color (original behavior)
+                color = get_track_color(tid, all_track_ids)
+
+                # Draw trajectory as spline
+                try:
+                    spline = server.scene.add_spline_catmull_rom(
+                        f"track_{tid}",
+                        positions=centers,
+                        color=color,
+                    )
+                    track_handles.append(spline)
+
+                    # Add start marker
+                    marker = server.scene.add_icosphere(
+                        f"track_{tid}_start",
+                        radius=0.02,
+                        color=color,
+                        position=centers[0],
+                    )
+                    track_handles.append(marker)
+                except:
+                    pass
+
+    def visualize_bboxes():
+        """Visualize 3D bounding boxes as wireframes."""
+        for bh in bbox_handles:
             try:
-                spline = server.scene.add_spline_catmull_rom(
-                    f"track_{tid}",
-                    positions=centers,
-                    color=color,
-                )
-                track_handles.append(spline)
-
-                # Add start marker
-                marker = server.scene.add_icosphere(
-                    f"track_{tid}_start",
-                    radius=0.02,
-                    color=color,
-                    position=centers[0],
-                )
-                track_handles.append(marker)
+                bh.remove()
             except:
                 pass
+        bbox_handles.clear()
+
+        if not gui_show_bboxes.value or tracking_data is None:
+            return
+
+        tracks = tracking_data.get("tracks", {})
+        all_track_ids = [int(tid) for tid in tracks.keys()]
+        selected_frame = int(gui_frame_slider.value)
+
+        for tid_str, track_info in tracks.items():
+            tid = int(tid_str)
+            frames_list = track_info.get("frames", [])
+            centers = track_info.get("centers", [])
+            dimensions = track_info.get("dimensions", [])
+            rotations = track_info.get("rotation_matrices", [])
+
+            if not dimensions or not rotations:
+                continue
+
+            color = get_track_color(tid, all_track_ids)
+
+            for i, f_idx in enumerate(frames_list):
+                # Filter by frame if specified
+                if selected_frame >= 0 and f_idx != selected_frame:
+                    continue
+
+                if i >= len(dimensions) or i >= len(rotations) or i >= len(centers):
+                    continue
+
+                # Reconstruct bounding box
+                center = np.array(centers[i]) - scene_center
+                dims = np.array(dimensions[i])
+                rotation = np.array(rotations[i])
+
+                # Get corners
+                corners = compute_bbox_corners(center, dims, rotation)
+
+                # Draw wireframe edges
+                for edge_idx, (a, b) in enumerate(BBOX_EDGES):
+                    try:
+                        line = server.scene.add_spline_catmull_rom(
+                            f"bbox_{tid}_{f_idx}_{edge_idx}",
+                            positions=np.array([corners[a], corners[b]]),
+                            color=color,
+                        )
+                        bbox_handles.append(line)
+                    except:
+                        pass
 
     def update_point_cloud():
         current_percentage = gui_points_conf.value
@@ -323,6 +508,7 @@ def visualize_with_viser(
     @gui_frame_slider.on_update
     def _(_):
         update_point_cloud()
+        visualize_bboxes()  # Update bboxes when frame changes
 
     @gui_show_frames.on_update
     def _(_):
@@ -332,9 +518,18 @@ def visualize_with_viser(
     def _(_):
         visualize_tracks()
 
+    @gui_show_bboxes.on_update
+    def _(_):
+        visualize_bboxes()
+
+    @gui_speed_color.on_update
+    def _(_):
+        visualize_tracks()  # Re-render tracks with new color mode
+
     # Initial visualization
     visualize_frames()
     visualize_tracks()
+    visualize_bboxes()
 
     print("\nViser server started. Press Ctrl+C to stop.")
 
@@ -344,6 +539,174 @@ def visualize_with_viser(
             time.sleep(0.01)
     except KeyboardInterrupt:
         print("\nShutting down...")
+
+
+def draw_bbox_wireframe(img: np.ndarray, corners_2d: np.ndarray, color: tuple, thickness: int = 2):
+    """Draw 3D bounding box wireframe on image.
+
+    Args:
+        img: Image to draw on (modified in place)
+        corners_2d: (8, 2) array of projected corner coordinates
+        color: BGR color tuple
+        thickness: Line thickness
+    """
+    edges = [
+        (0, 1), (1, 2), (2, 3), (3, 0),  # Bottom face
+        (4, 5), (5, 6), (6, 7), (7, 4),  # Top face
+        (0, 4), (1, 5), (2, 6), (3, 7),  # Vertical edges
+    ]
+
+    for a, b in edges:
+        pt1 = tuple(corners_2d[a].astype(int))
+        pt2 = tuple(corners_2d[b].astype(int))
+        cv2.line(img, pt1, pt2, color, thickness)
+
+
+def generate_annotated_2d(output_dir: str, predictions: dict, tracking_data: Dict):
+    """Generate annotated 2D images with projected bounding boxes.
+
+    Args:
+        output_dir: Output directory (will create annotated_2d subfolder)
+        predictions: Predictions dict with extrinsics, intrinsics
+        tracking_data: Tracking summary dict with tracks
+    """
+    if not HAS_CV2:
+        print("Error: OpenCV (cv2) not available. Cannot generate annotated images.")
+        return
+
+    if tracking_data is None:
+        print("Error: No tracking data available. Cannot generate annotated images.")
+        return
+
+    # Load metadata to get image paths
+    metadata_path = os.path.join(output_dir, "metadata.json")
+    if not os.path.exists(metadata_path):
+        print(f"Error: metadata.json not found in {output_dir}")
+        return
+
+    with open(metadata_path, 'r') as f:
+        metadata = json.load(f)
+
+    image_files = metadata.get("image_files", [])
+    if not image_files:
+        print("Error: No image files found in metadata")
+        return
+
+    extrinsics = predictions["extrinsic"]  # (S, 3, 4)
+    intrinsics = predictions["intrinsic"]  # (S, 3, 3)
+
+    annotated_dir = os.path.join(output_dir, "annotated_2d")
+    os.makedirs(annotated_dir, exist_ok=True)
+
+    tracks = tracking_data.get("tracks", {})
+    all_track_ids = [int(tid) for tid in tracks.keys()]
+
+    print(f"\n=== Generating Annotated 2D Images ===")
+
+    # Build per-frame bounding box data
+    num_frames = len(image_files)
+    frame_bboxes = {i: [] for i in range(num_frames)}
+
+    for tid_str, track_info in tracks.items():
+        tid = int(tid_str)
+        frames_list = track_info.get("frames", [])
+        centers = track_info.get("centers", [])
+        dimensions = track_info.get("dimensions", [])
+        rotations = track_info.get("rotation_matrices", [])
+        class_name = track_info.get("class_name", "object")
+
+        if not dimensions or not rotations:
+            continue
+
+        for i, f_idx in enumerate(frames_list):
+            if i >= len(dimensions) or i >= len(rotations) or i >= len(centers):
+                continue
+            if f_idx >= num_frames:
+                continue
+
+            frame_bboxes[f_idx].append({
+                'track_id': tid,
+                'center': np.array(centers[i]),
+                'dimensions': np.array(dimensions[i]),
+                'rotation': np.array(rotations[i]),
+                'class_name': class_name,
+            })
+
+    # Process each frame
+    for frame_idx, img_path in enumerate(image_files):
+        if not os.path.exists(img_path):
+            print(f"Warning: Image not found: {img_path}")
+            continue
+
+        img = cv2.imread(img_path)
+        if img is None:
+            continue
+
+        orig_h, orig_w = img.shape[:2]
+        K = intrinsics[frame_idx]  # (3, 3)
+        ext = extrinsics[frame_idx]  # (3, 4)
+
+        # Scale intrinsics if needed (model size vs original size)
+        # Assume intrinsics are calibrated for the model output size
+        if "depth" in predictions:
+            model_h, model_w = predictions["depth"].shape[1:3]
+            scale_x = orig_w / model_w
+            scale_y = orig_h / model_h
+            K_scaled = K.copy()
+            K_scaled[0, 0] *= scale_x  # fx
+            K_scaled[1, 1] *= scale_y  # fy
+            K_scaled[0, 2] *= scale_x  # cx
+            K_scaled[1, 2] *= scale_y  # cy
+        else:
+            K_scaled = K
+
+        for bbox_data in frame_bboxes[frame_idx]:
+            tid = bbox_data['track_id']
+            center = bbox_data['center']
+            dims = bbox_data['dimensions']
+            rotation = bbox_data['rotation']
+            class_name = bbox_data['class_name']
+
+            # Compute 3D corners
+            corners_3d = compute_bbox_corners(center, dims, rotation)
+
+            # Transform to camera coordinates
+            corners_h = np.concatenate([corners_3d, np.ones((8, 1))], axis=1)
+            corners_cam = (ext @ corners_h.T).T  # (8, 3)
+
+            # Check if in front of camera
+            if np.any(corners_cam[:, 2] <= 0):
+                continue
+
+            # Project to image
+            corners_2d_h = (K_scaled @ corners_cam.T).T
+            corners_2d = corners_2d_h[:, :2] / corners_2d_h[:, 2:3]
+
+            # Check bounds
+            if np.any(corners_2d < -orig_w) or np.any(corners_2d > 2 * orig_w):
+                continue
+
+            # Get color for this track
+            color_rgb = get_track_color(tid, all_track_ids)
+            color_bgr = tuple(int(c * 255) for c in color_rgb[::-1])
+
+            # Draw wireframe
+            draw_bbox_wireframe(img, corners_2d, color_bgr)
+
+            # Add label
+            center_2d = np.mean(corners_2d, axis=0).astype(int)
+            center_2d[0] = max(10, min(center_2d[0], orig_w - 100))
+            center_2d[1] = max(20, min(center_2d[1], orig_h - 10))
+            label = f"T{tid}: {class_name}"
+            cv2.putText(img, label, tuple(center_2d),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color_bgr, 1, cv2.LINE_AA)
+
+        # Save annotated image
+        frame_name = os.path.splitext(os.path.basename(img_path))[0]
+        output_path = os.path.join(annotated_dir, f"{frame_name}_tracked.png")
+        cv2.imwrite(output_path, img)
+
+    print(f"Saved annotated frames to {annotated_dir}")
 
 
 def parse_args():
@@ -357,6 +720,9 @@ Examples:
 
     # Custom port and confidence threshold
     python visualize_saved.py --output_dir ./outputs/scene --port 8081 --conf_threshold 60
+
+    # Generate annotated 2D images only (no viser)
+    python visualize_saved.py --output_dir ./outputs/scene --generate_annotated_2d
         """
     )
     parser.add_argument("--output_dir", type=str, required=True,
@@ -367,6 +733,8 @@ Examples:
                         help="Initial confidence threshold percentile")
     parser.add_argument("--use_point_map", action="store_true",
                         help="Use point map instead of depth-based points")
+    parser.add_argument("--generate_annotated_2d", action="store_true",
+                        help="Generate annotated 2D images with projected bboxes (requires tracking data)")
     return parser.parse_args()
 
 
@@ -383,7 +751,12 @@ def main():
     # Load tracking data if available
     tracking_data = load_tracking_data(args.output_dir)
 
-    # Visualize
+    # Generate annotated 2D images if requested
+    if args.generate_annotated_2d:
+        generate_annotated_2d(args.output_dir, predictions, tracking_data)
+        return  # Exit after generating images
+
+    # Visualize with viser
     visualize_with_viser(
         predictions,
         tracking_data=tracking_data,
