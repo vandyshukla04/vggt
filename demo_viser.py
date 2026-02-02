@@ -7,9 +7,11 @@
 import os
 import glob
 import time
+import json
 import threading
 import argparse
 from typing import List, Optional
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -24,7 +26,7 @@ try:
 except ImportError:
     print("onnxruntime not found. Sky segmentation may not work.")
 
-from visual_util import segment_sky, download_file_from_url
+from visual_util import segment_sky, download_file_from_url, predictions_to_glb
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 from vggt.utils.geometry import closed_form_inverse_se3, unproject_depth_map_to_point_map
@@ -316,6 +318,8 @@ parser.add_argument(
     "--conf_threshold", type=float, default=25.0, help="Initial percentage of low-confidence points to filter out"
 )
 parser.add_argument("--mask_sky", action="store_true", help="Apply sky segmentation to filter out sky points")
+parser.add_argument("--max_images", type=int, default=None, help="Maximum number of images to process (to avoid OOM)")
+parser.add_argument("--output_path", type=str, default=None, help="Output directory to save GLB and metadata (if not set, only launches viewer)")
 
 
 def main():
@@ -341,31 +345,35 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
+    t0 = time.time()
     print("Initializing and loading VGGT model...")
-    # model = VGGT.from_pretrained("facebook/VGGT-1B")
-
-    model = VGGT()
-    _URL = "https://huggingface.co/facebook/VGGT-1B/resolve/main/model.pt"
-    model.load_state_dict(torch.hub.load_state_dict_from_url(_URL))
-
+    model = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
     model.eval()
-    model = model.to(device)
+    print(f"Model loading: {time.time() - t0:.2f}s")
 
     # Use the provided image folder path
+    t1 = time.time()
     print(f"Loading images from {args.image_folder}...")
-    image_names = glob.glob(os.path.join(args.image_folder, "*"))
-    print(f"Found {len(image_names)} images")
+    image_names = sorted(glob.glob(os.path.join(args.image_folder, "*")))
+    if args.max_images is not None:
+        image_names = image_names[:args.max_images]
+    print(f"Using {len(image_names)} images")
 
     images = load_and_preprocess_images(image_names).to(device)
     print(f"Preprocessed images shape: {images.shape}")
+    print(f"Image loading: {time.time() - t1:.2f}s")
 
+    t2 = time.time()
     print("Running inference...")
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     with torch.no_grad():
         with torch.cuda.amp.autocast(dtype=dtype):
             predictions = model(images)
+    torch.cuda.synchronize()
+    print(f"Inference: {time.time() - t2:.2f}s")
 
+    t3 = time.time()
     print("Converting pose encoding to extrinsic and intrinsic matrices...")
     extrinsic, intrinsic = pose_encoding_to_extri_intri(predictions["pose_enc"], images.shape[-2:])
     predictions["extrinsic"] = extrinsic
@@ -375,6 +383,7 @@ def main():
     for key in predictions.keys():
         if isinstance(predictions[key], torch.Tensor):
             predictions[key] = predictions[key].cpu().numpy().squeeze(0)  # remove batch dimension and convert to numpy
+    print(f"Post-processing: {time.time() - t3:.2f}s")
 
     if args.use_point_map:
         print("Visualizing 3D points from point map")
@@ -383,6 +392,46 @@ def main():
 
     if args.mask_sky:
         print("Sky segmentation enabled - will filter out sky points")
+
+    total_time = time.time() - t0
+    print(f"\nTotal processing time: {total_time:.2f}s")
+
+    # Save results if output path is specified
+    if args.output_path:
+        os.makedirs(args.output_path, exist_ok=True)
+
+        # Save GLB file
+        t4 = time.time()
+        print(f"Saving GLB to {args.output_path}...")
+        scene = predictions_to_glb(predictions, conf_thres=args.conf_threshold)
+        glb_path = os.path.join(args.output_path, "scene.glb")
+        scene.export(glb_path)
+        print(f"GLB saved: {time.time() - t4:.2f}s")
+
+        # Save metadata
+        metadata = {
+            "input_path": os.path.abspath(args.image_folder),
+            "output_path": os.path.abspath(args.output_path),
+            "num_frames": len(image_names),
+            "image_files": [os.path.basename(f) for f in image_names],
+            "max_images_setting": args.max_images,
+            "conf_threshold": args.conf_threshold,
+            "use_point_map": args.use_point_map,
+            "mask_sky": args.mask_sky,
+            "image_shape": list(images.shape),
+            "timestamp": datetime.now().isoformat(),
+            "processing_time_seconds": {
+                "model_loading": round(t1 - t0, 2),
+                "image_loading": round(t2 - t1, 2),
+                "inference": round(t3 - t2, 2),
+                "post_processing": round(total_time - (t3 - t0), 2),
+                "total": round(total_time, 2)
+            }
+        }
+        metadata_path = os.path.join(args.output_path, "metadata.json")
+        with open(metadata_path, "w") as f:
+            json.dump(metadata, f, indent=2)
+        print(f"Metadata saved to {metadata_path}")
 
     print("Starting viser visualization...")
 
