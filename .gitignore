@@ -148,5 +148,5 @@ skyseg.onnx
 .pixi
 *.egg-info
 
-wd_data/*
+wd_data*
 outputs/*
