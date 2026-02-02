@@ -1343,6 +1343,12 @@ def save_trajectory_plots(output_dir: str, bounding_boxes: List[List[BoundingBox
             })
 
     if not trajectories:
+        print("No trajectories to plot (no valid track_ids found in bounding boxes)")
+        # Debug: count bboxes with various track_id states
+        total_bboxes = sum(len(fb) for fb in bounding_boxes)
+        none_ids = sum(1 for fb in bounding_boxes for b in fb if b.track_id is None)
+        neg_ids = sum(1 for fb in bounding_boxes for b in fb if b.track_id is not None and b.track_id < 0)
+        print(f"  Total bboxes: {total_bboxes}, track_id=None: {none_ids}, track_id<0: {neg_ids}")
         return
 
     # 3D plot
