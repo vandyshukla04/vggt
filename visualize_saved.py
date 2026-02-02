@@ -62,14 +62,20 @@ def load_predictions(output_dir: str) -> dict:
     """Load predictions from saved files."""
     predictions_path = os.path.join(output_dir, "predictions.pt")
 
+    def maybe_squeeze_batch(arr):
+        """Remove batch dimension if it exists and equals 1."""
+        if arr.ndim > 0 and arr.shape[0] == 1:
+            return arr[0]
+        return arr
+
     if os.path.exists(predictions_path):
         print(f"Loading predictions from {predictions_path}")
         predictions = torch.load(predictions_path, map_location="cpu")
 
-        # Convert to numpy
+        # Convert to numpy (safely handle batch dimension)
         for key in predictions.keys():
             if isinstance(predictions[key], torch.Tensor):
-                predictions[key] = predictions[key].numpy().squeeze(0)
+                predictions[key] = maybe_squeeze_batch(predictions[key].numpy())
 
         return predictions
 
