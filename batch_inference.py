@@ -371,8 +371,8 @@ Examples:
                         help="Path to DJI SRT file for gimbal/GPS data")
     parser.add_argument("--use_gps_refinement", action="store_true",
                         help="Enable GPS-based pose refinement")
-    parser.add_argument("--num_images", type=int, default=20,
-                        help="Max number of images to process (VGGT limit ~20)")
+    parser.add_argument("--num_images", type=int, default=None,
+                        help="Max number of images to process (default: all images)")
     parser.add_argument("--skip", type=int, default=1,
                         help="Skip factor for frame subsampling")
     parser.add_argument("--conf_threshold", type=float, default=50.0,
