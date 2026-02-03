@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/shuklva/CUT3R/examples/wd_data/rhinos_cami/rhin-30_2/**)",
+      "Read(//home/shuklva/CUT3R/examples/wd_data/zebras_KABR/zebr-13_1_5/**)"
+    ]
+  }
+}

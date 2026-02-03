@@ -406,13 +406,89 @@ class ImprovedTracker:
 
 
 # =============================================================================
-# DJI SRT Log Parsing
+# DJI SRT Log Parsing (supports multiple SRT formats)
 # =============================================================================
 
-def parse_dji_logs(log_file_path: str, frame_indices: List[int]) -> Optional[Dict]:
-    """Parse DJI SRT log file to extract gimbal data for specific frames."""
-    gimbal_data = {}
+def _parse_srt_entry(entry_text: str) -> Optional[Dict]:
+    """
+    Parse a single SRT entry and extract all available telemetry data.
 
+    Supports three DJI SRT formats:
+    - Format 1 (V.SRT): gb_yaw/gb_pitch/gb_roll in <font> tag, rel_alt/abs_alt
+    - Format 2 (D.SRT): gimbal_heading/pitch/roll in CSV_DATA, rel_alt/abs_alt
+    - Format 3 (plain .SRT): gimbal_heading/pitch/roll in CSV_DATA, simple altitude
+    """
+    data = {}
+
+    # Extract frame count - handle both "FrameCnt: X" and "SrtCnt : X"
+    frame_match = re.search(r'(?:FrameCnt|SrtCnt)\s*:\s*(\d+)', entry_text)
+    if not frame_match:
+        return None
+    data['frame'] = int(frame_match.group(1))
+
+    # Extract gimbal data - try Format 1 first (gb_yaw/gb_pitch/gb_roll)
+    gimbal_format1 = re.search(r'\[gb_yaw:\s*([-\d.]+)\s+gb_pitch:\s*([-\d.]+)\s+gb_roll:\s*([-\d.]+)\]', entry_text)
+    if gimbal_format1:
+        data['yaw'] = float(gimbal_format1.group(1))
+        data['pitch'] = float(gimbal_format1.group(2))
+        data['roll'] = float(gimbal_format1.group(3))
+    else:
+        # Try Format 2/3 (gimbal_heading/gimbal_pitch/gimbal_roll in CSV_DATA)
+        yaw_match = re.search(r'\[gimbal_heading\(degrees\):\s*([-\d.]+)\]', entry_text)
+        pitch_match = re.search(r'\[gimbal_pitch\(degrees\):\s*([-\d.]+)\]', entry_text)
+        roll_match = re.search(r'\[gimbal_roll\(degrees\):\s*([-\d.]+)\]', entry_text)
+
+        if yaw_match and pitch_match and roll_match:
+            data['yaw'] = float(yaw_match.group(1))
+            data['pitch'] = float(pitch_match.group(1))
+            data['roll'] = float(roll_match.group(1))
+
+    # Check if we got gimbal data
+    if 'yaw' not in data:
+        return None
+
+    # Extract altitude - try rel_alt first (Format 1 & 2), then simple altitude (Format 3)
+    alt_match = re.search(r'\[rel_alt:\s*([-\d.]+)(?:\s+abs_alt:\s*([-\d.]+))?\]', entry_text)
+    if alt_match:
+        data['altitude'] = float(alt_match.group(1))
+        if alt_match.group(2):
+            data['abs_altitude'] = float(alt_match.group(2))
+    else:
+        # Format 3: simple [altitude: X]
+        simple_alt = re.search(r'\[altitude:\s*([-\d.]+)\]', entry_text)
+        if simple_alt:
+            data['altitude'] = float(simple_alt.group(1))
+
+    # Extract GPS coordinates
+    lat_match = re.search(r'\[latitude:\s*([-\d.]+)\]', entry_text)
+    lon_match = re.search(r'\[longitude:\s*([-\d.]+)\]', entry_text)
+    if lat_match and lon_match:
+        data['latitude'] = float(lat_match.group(1))
+        data['longitude'] = float(lon_match.group(1))
+
+    # Extract focal length (handle optional spaces around colon)
+    focal_match = re.search(r'\[focal_len\s*:\s*([-\d.]+)\]', entry_text)
+    if focal_match:
+        data['focal_len'] = float(focal_match.group(1))
+
+    return data
+
+
+def _split_srt_entries(content: str) -> List[str]:
+    """Split SRT file content into individual entries."""
+    # SRT entries are separated by blank lines and start with a number
+    entries = re.split(r'\n\s*\n', content)
+    return [e.strip() for e in entries if e.strip()]
+
+
+def parse_dji_logs(log_file_path: str, frame_indices: List[int]) -> Optional[Dict]:
+    """
+    Parse DJI SRT log file to extract gimbal data for specific frames.
+
+    Supports multiple DJI SRT formats:
+    - Format 1: gb_yaw/gb_pitch/gb_roll syntax (older drones)
+    - Format 2/3: gimbal_heading/gimbal_pitch/gimbal_roll in CSV_DATA (newer drones)
+    """
     if not os.path.exists(log_file_path):
         print(f"DJI log file not found: {log_file_path}")
         return None
@@ -423,17 +499,22 @@ def parse_dji_logs(log_file_path: str, frame_indices: List[int]) -> Optional[Dic
 
     print(f"SRT file size: {len(content):,} characters")
 
-    # Pattern for gimbal data
-    pattern = r'FrameCnt: (\d+).*?\[rel_alt: ([\d.]+).*?\[gb_yaw: ([-\d.]+) gb_pitch: ([-\d.]+) gb_roll: ([-\d.]+)\]'
-    matches = re.findall(pattern, content, re.DOTALL)
+    # Parse all entries
+    entries = _split_srt_entries(content)
+    parsed_entries = []
 
-    print(f"Found {len(matches):,} gimbal entries in SRT file")
+    for entry in entries:
+        parsed = _parse_srt_entry(entry)
+        if parsed and 'yaw' in parsed:
+            parsed_entries.append(parsed)
 
-    if not matches:
+    print(f"Found {len(parsed_entries):,} gimbal entries in SRT file")
+
+    if not parsed_entries:
         print("No gimbal data found in SRT file")
         return None
 
-    srt_frame_indices = [int(match[0]) for match in matches]
+    srt_frame_indices = [e['frame'] for e in parsed_entries]
     srt_min, srt_max = min(srt_frame_indices), max(srt_frame_indices)
     print(f"SRT FrameCnt range: {srt_min:,} -> {srt_max:,}")
 
@@ -452,14 +533,15 @@ def parse_dji_logs(log_file_path: str, frame_indices: List[int]) -> Optional[Dic
     else:
         target_frames = set(srt_frame_indices)
 
-    for frame_cnt_str, altitude, yaw, pitch, roll in matches:
-        frame_cnt = int(frame_cnt_str)
+    gimbal_data = {}
+    for entry in parsed_entries:
+        frame_cnt = entry['frame']
         if frame_cnt in target_frames:
             gimbal_data[frame_cnt] = {
-                'yaw': float(yaw),
-                'pitch': float(pitch),
-                'roll': float(roll),
-                'altitude': float(altitude)
+                'yaw': entry['yaw'],
+                'pitch': entry['pitch'],
+                'roll': entry['roll'],
+                'altitude': entry.get('altitude', 0.0)
             }
 
     print(f"Parsed gimbal data for {len(gimbal_data):,} frames")
@@ -467,41 +549,58 @@ def parse_dji_logs(log_file_path: str, frame_indices: List[int]) -> Optional[Dic
 
 
 def parse_dji_logs_with_gps(log_file_path: str, frame_indices: List[int]) -> Optional[Dict]:
-    """Parse DJI SRT log file to extract gimbal AND GPS data."""
-    data = {}
+    """
+    Parse DJI SRT log file to extract gimbal AND GPS data.
 
+    Supports multiple DJI SRT formats:
+    - Format 1: gb_yaw/gb_pitch/gb_roll, rel_alt/abs_alt (older drones)
+    - Format 2/3: gimbal_heading/gimbal_pitch/gimbal_roll in CSV_DATA (newer drones)
+    """
     if not os.path.exists(log_file_path):
         print(f"DJI log file not found: {log_file_path}")
         return None
 
+    print(f"Parsing DJI log with GPS: {log_file_path}")
     with open(log_file_path, 'r') as f:
         content = f.read()
 
-    # Extended pattern with GPS
-    pattern = r'FrameCnt: (\d+).*?\[focal_len: ([\d.]+)\].*?\[latitude: ([-\d.]+)\] \[longitude: ([-\d.]+)\] \[rel_alt: ([\d.]+) abs_alt: ([\d.]+)\] \[gb_yaw: ([-\d.]+) gb_pitch: ([-\d.]+) gb_roll: ([-\d.]+)\]'
-    matches = re.findall(pattern, content, re.DOTALL)
+    # Parse all entries
+    entries = _split_srt_entries(content)
+    parsed_entries = []
 
-    if not matches:
-        print("GPS pattern not matched, falling back to gimbal-only parsing")
+    for entry in entries:
+        parsed = _parse_srt_entry(entry)
+        if parsed and 'yaw' in parsed:
+            parsed_entries.append(parsed)
+
+    if not parsed_entries:
+        print("No telemetry data found in SRT file")
+        return None
+
+    # Check if we have GPS data
+    has_gps = any('latitude' in e and 'longitude' in e for e in parsed_entries)
+    if not has_gps:
+        print("No GPS data found, falling back to gimbal-only parsing")
         return parse_dji_logs(log_file_path, frame_indices)
 
-    print(f"Found {len(matches):,} entries with GPS data")
+    print(f"Found {len(parsed_entries):,} entries with telemetry data")
 
-    srt_frame_indices = [int(match[0]) for match in matches]
+    srt_frame_indices = [e['frame'] for e in parsed_entries]
     target_frames = set(frame_indices) if frame_indices else set(srt_frame_indices)
 
-    for frame_cnt_str, focal_len, latitude, longitude, rel_alt, abs_alt, yaw, pitch, roll in matches:
-        frame_cnt = int(frame_cnt_str)
+    data = {}
+    for entry in parsed_entries:
+        frame_cnt = entry['frame']
         if frame_cnt in target_frames:
             data[frame_cnt] = {
-                'yaw': float(yaw),
-                'pitch': float(pitch),
-                'roll': float(roll),
-                'altitude': float(rel_alt),
-                'abs_altitude': float(abs_alt),
-                'latitude': float(latitude),
-                'longitude': float(longitude),
-                'focal_len': float(focal_len),
+                'yaw': entry['yaw'],
+                'pitch': entry['pitch'],
+                'roll': entry['roll'],
+                'altitude': entry.get('altitude', 0.0),
+                'abs_altitude': entry.get('abs_altitude', entry.get('altitude', 0.0)),
+                'latitude': entry.get('latitude', 0.0),
+                'longitude': entry.get('longitude', 0.0),
+                'focal_len': entry.get('focal_len', 0.0),
             }
 
     print(f"Parsed GPS data for {len(data):,} frames")
