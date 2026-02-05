@@ -367,6 +367,10 @@ Examples:
                         help="FPS used when generating SAM3 masks (default: read from metadata)")
     parser.add_argument("--object_class", type=str, default="object",
                         help="Default class name for SAM3 objects")
+    parser.add_argument("--sam3_class", type=str, default=None,
+                        help="Class name(s) to load from multi-class SAM3 output. "
+                             "Comma-separated for multiple classes (e.g., 'zebra,lion'). "
+                             "If not specified, loads all available classes.")
     parser.add_argument("--keep_frames", action="store_true",
                         help="Don't delete extracted frames after processing")
 
@@ -486,16 +490,43 @@ def main():
             masks_data = None
             if args.sam3_masks:
                 print(f"\n=== Loading SAM3 Masks ===")
+
+                # Parse class names if provided
+                class_names = None
+                if args.sam3_class:
+                    class_names = [c.strip() for c in args.sam3_class.split(',')]
+
                 # Use direct frame matching when user specifies start_frame/end_frame
                 use_direct_match = (args.start_frame is not None or args.end_frame is not None)
-                masks_data = load_sam3_masks(
-                    sam3_output_dir=args.sam3_masks,
-                    extracted_frame_indices=frame_indices,
-                    video_fps=video_info['fps'],
-                    sam3_fps=args.sam3_fps or target_fps,
-                    class_name=args.object_class,
-                    direct_frame_match=use_direct_match
-                )
+
+                # Check format and load appropriately
+                from vggt.utils.sam3_mask_loader import detect_sam3_format, load_sam3_masks_multi_class
+                format_info = detect_sam3_format(args.sam3_masks)
+
+                if format_info['format'] == 'multi_class':
+                    # Multi-class format
+                    if class_names is None:
+                        print(f"Auto-loading all {len(format_info['classes'])} class(es)")
+
+                    masks_data = load_sam3_masks_multi_class(
+                        sam3_output_dir=args.sam3_masks,
+                        extracted_frame_indices=frame_indices,
+                        video_fps=video_info['fps'],
+                        sam3_fps=args.sam3_fps or target_fps,
+                        class_names=class_names,
+                        direct_frame_match=use_direct_match
+                    )
+                else:
+                    # Single-class format (backward compatibility)
+                    masks_data = load_sam3_masks(
+                        sam3_output_dir=args.sam3_masks,
+                        extracted_frame_indices=frame_indices,
+                        video_fps=video_info['fps'],
+                        sam3_fps=args.sam3_fps or target_fps,
+                        class_name=args.object_class,
+                        direct_frame_match=use_direct_match,
+                        auto_detect_format=False  # Already detected
+                    )
 
             if masks_data:
                 run_tracking(

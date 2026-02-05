@@ -174,13 +174,143 @@ def compute_bbox_from_mask(mask: np.ndarray) -> List[int]:
     return [int(x_min), int(y_min), int(x_max - x_min + 1), int(y_max - y_min + 1)]
 
 
+def detect_sam3_format(sam3_output_dir: str) -> Dict[str, Any]:
+    """
+    Detect SAM3 output format (old single-class vs new multi-class).
+
+    Args:
+        sam3_output_dir: Root directory of SAM3 output
+
+    Returns:
+        Dict with keys:
+            - 'format': 'single_class' | 'multi_class' | 'unknown'
+            - 'classes': List of class names (for multi-class format)
+            - 'masks_dir': Path to masks/ directory (for single-class format)
+    """
+    if not os.path.exists(sam3_output_dir):
+        return {
+            'format': 'unknown',
+            'classes': [],
+            'masks_dir': None
+        }
+
+    # Check if masks/ exists directly (old single-class format)
+    masks_dir = os.path.join(sam3_output_dir, "masks")
+    if os.path.exists(masks_dir) and os.path.isdir(masks_dir):
+        return {
+            'format': 'single_class',
+            'classes': [],
+            'masks_dir': masks_dir
+        }
+
+    # Check for class subdirectories (new multi-class format)
+    # Look for directories containing masks/ subdirectories
+    classes = []
+    for entry in os.listdir(sam3_output_dir):
+        entry_path = os.path.join(sam3_output_dir, entry)
+        if os.path.isdir(entry_path):
+            class_masks_dir = os.path.join(entry_path, "masks")
+            if os.path.exists(class_masks_dir) and os.path.isdir(class_masks_dir):
+                classes.append(entry)
+
+    if classes:
+        return {
+            'format': 'multi_class',
+            'classes': sorted(classes),
+            'masks_dir': None
+        }
+
+    # No valid format detected
+    return {
+        'format': 'unknown',
+        'classes': [],
+        'masks_dir': None
+    }
+
+
+def load_sam3_masks_multi_class(
+    sam3_output_dir: str,
+    extracted_frame_indices: List[int],
+    video_fps: float,
+    sam3_fps: Optional[float] = None,
+    class_names: Optional[List[str]] = None,
+    direct_frame_match: bool = False
+) -> Dict[int, List[Dict]]:
+    """
+    Load SAM3 masks from multi-class directory structure.
+
+    Args:
+        sam3_output_dir: Root directory of SAM3 output
+        extracted_frame_indices: List of video frame indices
+        video_fps: Original video FPS
+        sam3_fps: FPS used for SAM3 processing
+        class_names: List of class names to load (None = load all available)
+        direct_frame_match: Use direct frame index matching
+
+    Returns:
+        Same format as load_sam3_masks() but with proper class_name for each mask
+    """
+    format_info = detect_sam3_format(sam3_output_dir)
+
+    if format_info['format'] != 'multi_class':
+        raise ValueError(f"Expected multi-class format but got: {format_info['format']}")
+
+    available_classes = format_info['classes']
+
+    # Determine which classes to load
+    if class_names is None:
+        classes_to_load = available_classes
+        print(f"Auto-loading all {len(classes_to_load)} class(es): {classes_to_load}")
+    else:
+        # Validate requested classes exist
+        missing = set(class_names) - set(available_classes)
+        if missing:
+            raise ValueError(
+                f"Classes not found: {sorted(missing)}. "
+                f"Available classes: {available_classes}"
+            )
+        classes_to_load = class_names
+        print(f"Loading {len(classes_to_load)} class(es): {classes_to_load}")
+
+    # Load masks from each class subdirectory
+    all_masks_data = {}
+
+    for class_name in classes_to_load:
+        class_dir = os.path.join(sam3_output_dir, class_name)
+        print(f"\n=== Loading class: {class_name} ===")
+
+        # Use existing load_sam3_masks() on the class subdirectory
+        class_masks = load_sam3_masks(
+            sam3_output_dir=class_dir,
+            extracted_frame_indices=extracted_frame_indices,
+            video_fps=video_fps,
+            sam3_fps=sam3_fps,
+            class_name=class_name,  # Use actual class name
+            direct_frame_match=direct_frame_match,
+            auto_detect_format=False  # Already know it's single-class
+        )
+
+        # Merge with all_masks_data
+        for frame_idx, masks_list in class_masks.items():
+            if frame_idx not in all_masks_data:
+                all_masks_data[frame_idx] = []
+            all_masks_data[frame_idx].extend(masks_list)
+
+    total_masks = sum(len(masks) for masks in all_masks_data.values())
+    print(f"\n=== Multi-class loading complete ===")
+    print(f"Total masks loaded: {total_masks} across {len(extracted_frame_indices)} frames")
+
+    return all_masks_data
+
+
 def load_sam3_masks(
     sam3_output_dir: str,
     extracted_frame_indices: List[int],
     video_fps: float,
     sam3_fps: Optional[float] = None,
     class_name: str = "object",
-    direct_frame_match: bool = False
+    direct_frame_match: bool = False,
+    auto_detect_format: bool = True
 ) -> Dict[int, List[Dict]]:
     """
     Load SAM3 masks for all extracted frames.
@@ -199,6 +329,7 @@ def load_sam3_masks(
         direct_frame_match: If True, use video frame indices directly as SAM3 frame indices
             (useful when extraction fps matches sam3 fps, or when --start_frame/--end_frame
             are used to match SAM3 mask frame numbers)
+        auto_detect_format: If True, automatically detect and handle multi-class format
 
     Returns:
         Dict mapping extracted frame index (0, 1, 2, ...) to list of mask dicts:
@@ -215,6 +346,33 @@ def load_sam3_masks(
             ]
         }
     """
+    # Auto-detect format and route to appropriate loader
+    if auto_detect_format:
+        format_info = detect_sam3_format(sam3_output_dir)
+
+        if format_info['format'] == 'multi_class':
+            print(f"Detected multi-class SAM3 format with {len(format_info['classes'])} class(es)")
+            print(f"Available classes: {format_info['classes']}")
+            print(f"Loading all classes (use --sam3_class to specify subset)")
+
+            return load_sam3_masks_multi_class(
+                sam3_output_dir=sam3_output_dir,
+                extracted_frame_indices=extracted_frame_indices,
+                video_fps=video_fps,
+                sam3_fps=sam3_fps,
+                class_names=None,  # Load all
+                direct_frame_match=direct_frame_match
+            )
+        elif format_info['format'] == 'unknown':
+            raise ValueError(
+                f"Could not detect valid SAM3 format in: {sam3_output_dir}\n"
+                f"Expected either:\n"
+                f"  - Single-class: {sam3_output_dir}/masks/\n"
+                f"  - Multi-class: {sam3_output_dir}/class_name/masks/"
+            )
+        # else: format is 'single_class', continue with existing logic below
+
+    # Existing single-class loading implementation
     # Load metadata to get sam3_fps if not provided
     metadata = load_sam3_metadata(sam3_output_dir)
 
