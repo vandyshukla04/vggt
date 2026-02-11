@@ -1555,6 +1555,9 @@ def viser_wrapper_with_tracking(
     gui_points_conf = server.gui.add_slider(
         "Confidence Percent", min=0, max=100, step=0.1, initial_value=init_conf_threshold
     )
+    gui_bbox_thickness = server.gui.add_slider(
+        "Bbox Line Thickness", min=0.5, max=5.0, step=0.5, initial_value=2.0
+    )
     # Use slider instead of dropdown for frame selection
     gui_frame_slider = server.gui.add_slider(
         "Frame", min=-1, max=S-1, step=1, initial_value=-1
@@ -1619,10 +1622,15 @@ def viser_wrapper_with_tracking(
 
     def visualize_bboxes():
         """Visualize bounding boxes for selected frame or all frames."""
+        # Remove existing bbox handles safely
+        valid_handles = []
         for bh in bbox_handles:
             try:
+                # Check if handle still exists by accessing a property
+                _ = bh.name
                 bh.remove()
-            except:
+            except (RuntimeError, AttributeError):
+                # Handle was already removed or invalid
                 pass
         bbox_handles.clear()
 
@@ -1631,6 +1639,7 @@ def viser_wrapper_with_tracking(
 
         selected_frame = int(gui_frame_slider.value)
         show_all = gui_show_all_bboxes.value or selected_frame < 0
+        line_thickness = gui_bbox_thickness.value
 
         for frame_idx, frame_bboxes in enumerate(bounding_boxes):
             # Only show bboxes for selected frame, unless "show all" is enabled
@@ -1652,6 +1661,7 @@ def viser_wrapper_with_tracking(
                             f"bbox_{frame_idx}_{bbox.track_id}_{edge_idx}",
                             positions=np.array([corners_centered[a], corners_centered[b]]),
                             color=color,
+                            line_width=line_thickness,
                         )
                         bbox_handles.append(line)
                     except:
@@ -1693,6 +1703,10 @@ def viser_wrapper_with_tracking(
         visualize_bboxes()
 
     @gui_show_all_bboxes.on_update
+    def _(_):
+        visualize_bboxes()
+
+    @gui_bbox_thickness.on_update
     def _(_):
         visualize_bboxes()
 
