@@ -24,6 +24,9 @@ import time
 from typing import Dict, List, Optional
 
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 import viser
 
 # Open3D for PLY loading
@@ -81,30 +84,98 @@ def load_smoothed_tracklets(filepath: str) -> Optional[Dict]:
     return data
 
 
+def save_topdown_image(
+    points: np.ndarray,
+    colors: np.ndarray,
+    tracklets_data: Optional[Dict],
+    output_path: str,
+    dpi: int = 300,
+    subsample_ratio: float = 0.3,
+) -> str:
+    """Render a top-down (bird's eye) image of the ground with tracklet overlays.
+
+    Projects onto the X-Z plane (Y is height/up). Produces a rasterized PNG
+    that doesn't suffer from the point-size artifacts seen in viser.
+    """
+    fig, ax = plt.subplots(figsize=(20, 20))
+
+    # Subsample ground points for rendering speed
+    n = len(points)
+    if subsample_ratio < 1.0 and n > 0:
+        k = max(1, int(n * subsample_ratio))
+        idx = np.random.choice(n, k, replace=False)
+        pts = points[idx]
+        clrs = colors[idx] / 255.0
+    else:
+        pts = points
+        clrs = colors / 255.0
+
+    if len(pts) > 0:
+        ax.scatter(
+            pts[:, 0], pts[:, 2],
+            c=clrs, s=0.1, alpha=0.4, marker=".", rasterized=True,
+        )
+
+    # Overlay smoothed tracklets
+    if tracklets_data:
+        tracks = tracklets_data.get("tracks", {})
+        sorted_ids = sorted(tracks.keys(), key=lambda x: int(x))
+        for i, tid in enumerate(sorted_ids):
+            track = tracks[tid]
+            centers = np.array(track.get("smoothed_centers", []))
+            if len(centers) < 2:
+                continue
+            color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+            class_name = track.get("class_name", "object")
+            ax.plot(
+                centers[:, 0], centers[:, 2],
+                color=color, linewidth=3, label=f"T{tid}: {class_name}",
+            )
+            ax.scatter(
+                centers[0, 0], centers[0, 2],
+                color=color, s=80, marker="o", zorder=5,
+                edgecolors="white", linewidths=0.5,
+            )
+        if sorted_ids:
+            ax.legend(loc="upper right", fontsize=8)
+
+    ax.set_aspect("equal")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Z (m)")
+    ax.set_title("Ground Reconstruction - Top-Down View")
+
+    plt.savefig(output_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved top-down image to {output_path}")
+    return output_path
+
+
 def visualize(
     result_dir: str,
     port: int = 8080,
     point_size: float = 0.01,
-    use_combined: bool = True,
 ):
     """Launch interactive viser visualization.
 
     Args:
-        result_dir: Directory containing ground_with_tracklets.ply and smoothed_tracklets.json
+        result_dir: Directory containing ground_point_cloud.ply and smoothed_tracklets.json
         port: Viser server port
         point_size: Point size for rendering
-        use_combined: If True, load combined PLY; if False, load ground-only PLY
     """
     print(f"\n{'='*60}")
     print("Ground Tracklets Visualization")
     print(f"{'='*60}")
     print(f"Loading from: {result_dir}\n")
 
-    # Load data
-    if use_combined:
-        ply_path = os.path.join(result_dir, "ground_with_tracklets.ply")
+    # Always load ground-only PLY for the point cloud so track filters
+    # can properly hide tracklets (the combined PLY has tracklet colors baked in).
+    # Fall back to combined PLY if ground-only doesn't exist.
+    ground_ply = os.path.join(result_dir, "ground_point_cloud.ply")
+    combined_ply = os.path.join(result_dir, "ground_with_tracklets.ply")
+    if os.path.exists(ground_ply):
+        ply_path = ground_ply
     else:
-        ply_path = os.path.join(result_dir, "ground_point_cloud.ply")
+        ply_path = combined_ply
 
     pcd_data = load_point_cloud(ply_path)
     tracklets_data = load_smoothed_tracklets(
@@ -142,6 +213,11 @@ def visualize(
         gui_subsample = server.gui.add_slider(
             "Point Density %", min=10, max=100, step=5, initial_value=100
         )
+        gui_marker_size = server.gui.add_slider(
+            "Marker Size", min=0.001, max=0.1, step=0.001, initial_value=0.01
+        )
+        gui_show_labels = server.gui.add_checkbox("Show Track Labels", initial_value=True)
+        gui_show_markers = server.gui.add_checkbox("Show Start/End Markers", initial_value=True)
 
     # Per-track toggle checkboxes
     track_checkboxes = {}
@@ -229,33 +305,35 @@ def visualize(
             )
             viz_handles["tracklets"].append(handle)
 
-            # Add start marker
-            start_handle = server.scene.add_icosphere(
-                name=f"/tracklet_{track_id}_start",
-                radius=0.05,
-                position=centers_centered[0],
-                color=color,
-            )
-            viz_handles["tracklets"].append(start_handle)
+            # Add start/end markers
+            if gui_show_markers.value:
+                marker_r = gui_marker_size.value
+                start_handle = server.scene.add_icosphere(
+                    name=f"/tracklet_{track_id}_start",
+                    radius=marker_r,
+                    position=centers_centered[0],
+                    color=color,
+                )
+                viz_handles["tracklets"].append(start_handle)
 
-            # Add end marker (different size)
-            end_handle = server.scene.add_icosphere(
-                name=f"/tracklet_{track_id}_end",
-                radius=0.03,
-                position=centers_centered[-1],
-                color=color,
-            )
-            viz_handles["tracklets"].append(end_handle)
+                end_handle = server.scene.add_icosphere(
+                    name=f"/tracklet_{track_id}_end",
+                    radius=marker_r * 0.6,
+                    position=centers_centered[-1],
+                    color=color,
+                )
+                viz_handles["tracklets"].append(end_handle)
 
             # Add label at midpoint
-            mid_idx = len(centers_centered) // 2
-            class_name = track.get("class_name", "object")
-            label_handle = server.scene.add_label(
-                name=f"/tracklet_label_{track_id}",
-                text=f"T{track_id}: {class_name}",
-                position=centers_centered[mid_idx],
-            )
-            viz_handles["tracklets"].append(label_handle)
+            if gui_show_labels.value:
+                mid_idx = len(centers_centered) // 2
+                class_name = track.get("class_name", "object")
+                label_handle = server.scene.add_label(
+                    name=f"/tracklet_label_{track_id}",
+                    text=f"T{track_id}: {class_name}",
+                    position=centers_centered[mid_idx],
+                )
+                viz_handles["tracklets"].append(label_handle)
 
     def update_all():
         update_point_cloud()
@@ -285,10 +363,25 @@ def visualize(
     def _(_):
         update_point_cloud()
 
-    for tid, checkbox in track_checkboxes.items():
-        @checkbox.on_update
+    @gui_marker_size.on_update
+    def _(_):
+        update_tracklets()
+
+    @gui_show_labels.on_update
+    def _(_):
+        update_tracklets()
+
+    @gui_show_markers.on_update
+    def _(_):
+        update_tracklets()
+
+    def _make_track_cb(cb):
+        @cb.on_update
         def _(_):
             update_tracklets()
+
+    for tid, checkbox in track_checkboxes.items():
+        _make_track_cb(checkbox)
 
     # Initial render
     update_all()
@@ -314,13 +407,12 @@ def main():
 Examples:
     python visualize_ground_tracklets.py --result_dir ./output/vggt/ground_tracklets/
     python visualize_ground_tracklets.py --result_dir ./output/vggt/ground_tracklets/ --port 8888
-    python visualize_ground_tracklets.py --result_dir ./output/vggt/ground_tracklets/ --ground_only
         """,
     )
 
     parser.add_argument(
         "--result_dir", type=str, required=True,
-        help="Directory containing ground_with_tracklets.ply and smoothed_tracklets.json",
+        help="Directory containing ground_point_cloud.ply and smoothed_tracklets.json",
     )
     parser.add_argument(
         "--port", type=int, default=8080,
@@ -331,8 +423,17 @@ Examples:
         help="Initial point size (default: 0.01)",
     )
     parser.add_argument(
-        "--ground_only", action="store_true",
-        help="Load ground-only PLY instead of combined PLY",
+        "--save_topdown", type=str, default=None,
+        help="Save a top-down PNG image to this path and exit (no viser). "
+             "Example: --save_topdown ./topdown.png",
+    )
+    parser.add_argument(
+        "--topdown_dpi", type=int, default=300,
+        help="DPI for the top-down image (default: 300)",
+    )
+    parser.add_argument(
+        "--topdown_subsample", type=float, default=0.3,
+        help="Fraction of ground points to render in top-down image (default: 0.3)",
     )
 
     args = parser.parse_args()
@@ -341,11 +442,35 @@ Examples:
         print(f"Error: Directory not found: {args.result_dir}")
         sys.exit(1)
 
+    # Top-down image mode: render and exit without launching viser
+    if args.save_topdown:
+        ground_ply = os.path.join(args.result_dir, "ground_point_cloud.ply")
+        combined_ply = os.path.join(args.result_dir, "ground_with_tracklets.ply")
+        ply_path = ground_ply if os.path.exists(ground_ply) else combined_ply
+
+        pcd_data = load_point_cloud(ply_path)
+        if pcd_data is None:
+            print("Error: Could not load point cloud.")
+            sys.exit(1)
+
+        tracklets_data = load_smoothed_tracklets(
+            os.path.join(args.result_dir, "smoothed_tracklets.json")
+        )
+
+        save_topdown_image(
+            points=pcd_data["points"],
+            colors=pcd_data["colors"],
+            tracklets_data=tracklets_data,
+            output_path=args.save_topdown,
+            dpi=args.topdown_dpi,
+            subsample_ratio=args.topdown_subsample,
+        )
+        sys.exit(0)
+
     visualize(
         result_dir=args.result_dir,
         port=args.port,
         point_size=args.point_size,
-        use_combined=not args.ground_only,
     )
 
 

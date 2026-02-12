@@ -48,6 +48,10 @@ import cv2
 from scipy.signal import savgol_filter
 from scipy.interpolate import CubicSpline
 
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from vggt.utils.geometry import unproject_depth_map_to_point_map
@@ -449,6 +453,88 @@ def sample_tracklet_points(
 
 
 # =============================================================================
+# Top-Down Image Export
+# =============================================================================
+
+
+def save_topdown_image(
+    ground_points: np.ndarray,
+    ground_colors: np.ndarray,
+    smoothed_tracks: Dict,
+    output_dir: str,
+    dpi: int = 300,
+    subsample_ratio: float = 0.3,
+) -> str:
+    """Render a top-down (bird's eye) image of the ground with tracklet overlays.
+
+    Projects onto the X-Z plane (Y is height/up). Produces a rasterized PNG
+    that doesn't suffer from the point-size artifacts seen in viser.
+
+    Args:
+        ground_points: (N, 3) ground point coordinates
+        ground_colors: (N, 3) uint8 RGB colors
+        smoothed_tracks: Dict from smooth_tracklets()
+        output_dir: Where to save the image
+        dpi: Output resolution (default: 300)
+        subsample_ratio: Fraction of ground points to render (default: 0.3)
+
+    Returns:
+        Path to the saved image
+    """
+    fig, ax = plt.subplots(figsize=(20, 20))
+
+    # Subsample ground points for rendering speed
+    n = len(ground_points)
+    if subsample_ratio < 1.0 and n > 0:
+        k = max(1, int(n * subsample_ratio))
+        idx = np.random.choice(n, k, replace=False)
+        pts = ground_points[idx]
+        clrs = ground_colors[idx] / 255.0
+    else:
+        pts = ground_points
+        clrs = ground_colors / 255.0
+
+    # Scatter ground points on X-Z plane
+    if len(pts) > 0:
+        ax.scatter(
+            pts[:, 0], pts[:, 2],
+            c=clrs, s=0.1, alpha=0.4, marker=".", rasterized=True,
+        )
+
+    # Overlay smoothed tracklets
+    sorted_ids = sorted(smoothed_tracks.keys(), key=lambda x: int(x))
+    for i, tid in enumerate(sorted_ids):
+        track = smoothed_tracks[tid]
+        centers = np.array(track["smoothed_centers"])
+        if len(centers) < 2:
+            continue
+        color = COLOR_PALETTE[i % len(COLOR_PALETTE)]
+        class_name = track.get("class_name", "object")
+        ax.plot(
+            centers[:, 0], centers[:, 2],
+            color=color, linewidth=3, label=f"T{tid}: {class_name}",
+        )
+        # Start marker
+        ax.scatter(
+            centers[0, 0], centers[0, 2],
+            color=color, s=80, marker="o", zorder=5,
+            edgecolors="white", linewidths=0.5,
+        )
+
+    ax.set_aspect("equal")
+    ax.set_xlabel("X (m)")
+    ax.set_ylabel("Z (m)")
+    ax.set_title("Ground Reconstruction - Top-Down View")
+    if sorted_ids:
+        ax.legend(loc="upper right", fontsize=8)
+
+    out_path = os.path.join(output_dir, "ground_topdown.png")
+    plt.savefig(out_path, dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    return out_path
+
+
+# =============================================================================
 # Main Pipeline
 # =============================================================================
 
@@ -536,6 +622,18 @@ Examples:
     parser.add_argument(
         "--use_point_map", action="store_true",
         help="Use world_points from model instead of depth-based unprojection",
+    )
+    parser.add_argument(
+        "--no_topdown", action="store_true",
+        help="Skip generating the top-down PNG image",
+    )
+    parser.add_argument(
+        "--topdown_dpi", type=int, default=300,
+        help="DPI for the top-down image (default: 300)",
+    )
+    parser.add_argument(
+        "--topdown_subsample", type=float, default=0.3,
+        help="Fraction of ground points to render in the top-down image (default: 0.3)",
     )
 
     args = parser.parse_args()
@@ -781,6 +879,22 @@ Examples:
     print(f"  Tracklet points: {len(tracklet_points):,}")
 
     # =========================================================================
+    # Step 7: Save top-down image
+    # =========================================================================
+    topdown_path = None
+    if not args.no_topdown:
+        print(f"\n=== Step 7: Rendering Top-Down Image ===")
+        topdown_path = save_topdown_image(
+            ground_points=ground_points,
+            ground_colors=ground_colors,
+            smoothed_tracks=smoothed_tracks,
+            output_dir=output_dir,
+            dpi=args.topdown_dpi,
+            subsample_ratio=args.topdown_subsample,
+        )
+        print(f"Saved top-down image to {topdown_path}")
+
+    # =========================================================================
     # Summary
     # =========================================================================
     print(f"\n{'='*60}")
@@ -789,6 +903,8 @@ Examples:
     print(f"  {ground_ply_path}")
     print(f"  {combined_ply_path}")
     print(f"  {tracklets_json_path}")
+    if topdown_path:
+        print(f"  {topdown_path}")
     print(f"\nTo visualize:")
     print(f"  python visualize_ground_tracklets.py --result_dir {output_dir}")
 
