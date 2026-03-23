@@ -9,13 +9,15 @@ FrameCnt values relative to the original video (e.g., 6240). This script
 applies a frame offset so VGGT's telemetry matching works correctly.
 
 Usage:
-    # From segment metadata (easiest)
+    # Frame offset from segment metadata (reads start_frame only, not paths)
     python batch_inference_segment.py \
-        --segment_metadata /path/to/seg1_metadata.json \
-        --sam3_masks /path/to/sam3_output/ \
+        --video /cluster/data/seg1.mp4 \
+        --dji_log /cluster/data/original.SRT \
+        --segment_metadata /cluster/data/seg1_metadata.json \
+        --sam3_masks /cluster/data/sam3_output/ \
         --output_dir ./outputs/
 
-    # With explicit overrides
+    # Explicit frame offset (no metadata file needed)
     python batch_inference_segment.py \
         --video seg1.mp4 \
         --dji_log /path/to/original.SRT \
@@ -49,10 +51,12 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-    # From segment metadata (reads video path, SRT path, frame offset)
+    # Frame offset from segment metadata (paths always explicit)
     python batch_inference_segment.py \\
-        --segment_metadata /path/to/seg1_metadata.json \\
-        --sam3_masks /path/to/sam3_output/ \\
+        --video /data/seg1.mp4 \\
+        --dji_log /data/original.SRT \\
+        --segment_metadata /data/seg1_metadata.json \\
+        --sam3_masks /data/sam3_output/ \\
         --output_dir ./outputs/
 
     # Explicit offset (no metadata file needed)
@@ -67,7 +71,7 @@ Examples:
     # Segment metadata (primary interface)
     parser.add_argument("--segment_metadata", type=str, default=None,
                         help="Path to segment metadata JSON from extract_segments.py. "
-                             "Auto-sets video, dji_log, and frame_offset.")
+                             "Only reads frame positioning (start_frame), not paths.")
 
     # Overrides / manual mode
     parser.add_argument("--video", type=str, default=None,
@@ -116,7 +120,7 @@ Examples:
 
     args = parser.parse_args()
 
-    # Resolve segment metadata
+    # Resolve segment metadata (only frame positioning info, not paths)
     if args.segment_metadata:
         if not os.path.isfile(args.segment_metadata):
             parser.error(f"Segment metadata not found: {args.segment_metadata}")
@@ -124,19 +128,10 @@ Examples:
         with open(args.segment_metadata) as f:
             seg_meta = json.load(f)
 
-        # Auto-set from metadata (CLI flags take precedence)
-        if args.video is None:
-            # Segment video is next to the metadata file
-            meta_dir = os.path.dirname(os.path.abspath(args.segment_metadata))
-            args.video = os.path.join(meta_dir, seg_meta["output_file"])
-
-        if args.dji_log is None:
-            args.dji_log = seg_meta.get("source_srt")
-
+        # Only read frame positioning — paths must be provided via CLI
         if args.frame_offset is None:
             args.frame_offset = seg_meta.get("start_frame", 0)
 
-        # Store full metadata for later
         args._seg_meta = seg_meta
     else:
         args._seg_meta = None
