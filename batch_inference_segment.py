@@ -163,8 +163,8 @@ def main():
     print(f"\n=== Segment Mode ===")
     print(f"Video: {args.video}")
     if args._seg_meta:
-        print(f"Source video: {args._seg_meta.get('source_video', 'unknown')}")
         print(f"Time range: {args._seg_meta.get('start_time')} -> {args._seg_meta.get('end_time')}")
+        print(f"Frame range: {args._seg_meta.get('start_frame')} -> {args._seg_meta.get('end_frame')}")
     print(f"Frame offset: {args.frame_offset}")
     if args.dji_log:
         print(f"DJI SRT: {args.dji_log}")
@@ -188,13 +188,25 @@ def main():
     elif args.sam3_fps:
         target_fps = args.sam3_fps
     elif args.sam3_masks:
-        metadata_path = os.path.join(args.sam3_masks, "metadata.json")
-        if os.path.exists(metadata_path):
-            with open(metadata_path, "r") as f:
-                sam3_metadata = json.load(f)
+        # Search for metadata.json at root or one level down (e.g., seg1/zebra/metadata.json)
+        sam3_metadata = None
+        for candidate in [
+            os.path.join(args.sam3_masks, "metadata.json"),
+            *[os.path.join(args.sam3_masks, d, "metadata.json")
+              for d in os.listdir(args.sam3_masks)
+              if os.path.isdir(os.path.join(args.sam3_masks, d))],
+        ]:
+            if os.path.exists(candidate):
+                with open(candidate, "r") as f:
+                    sam3_metadata = json.load(f)
+                print(f"Found SAM3 metadata: {candidate}")
+                break
+
+        if sam3_metadata:
             target_fps = sam3_metadata.get("fps", sam3_metadata.get("effective_fps", segment_fps))
             print(f"Using FPS from SAM3 metadata: {target_fps}")
         else:
+            print(f"WARNING: No SAM3 metadata.json found in {args.sam3_masks}, using segment FPS")
             target_fps = segment_fps
     else:
         target_fps = segment_fps
