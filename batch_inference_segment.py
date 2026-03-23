@@ -75,12 +75,15 @@ Examples:
 
     # Overrides / manual mode
     parser.add_argument("--video", type=str, default=None,
-                        help="Path to segment video (overrides metadata)")
+                        help="Path to segment video (required)")
     parser.add_argument("--dji_log", type=str, default=None,
                         help="Path to DJI SRT file (overrides metadata)")
     parser.add_argument("--frame_offset", type=int, default=None,
                         help="Frame offset to add for SRT matching "
                              "(overrides metadata start_frame)")
+    parser.add_argument("--original_fps", type=float, default=None,
+                        help="FPS of the original source video "
+                             "(overrides metadata video_fps). Used for SRT/mask matching.")
 
     # Frame extraction
     parser.add_argument("--extract_fps", type=float, default=None,
@@ -132,6 +135,9 @@ Examples:
         if args.frame_offset is None:
             args.frame_offset = seg_meta.get("start_frame", 0)
 
+        if args.original_fps is None:
+            args.original_fps = seg_meta.get("video_fps")
+
         args._seg_meta = seg_meta
     else:
         args._seg_meta = None
@@ -140,7 +146,7 @@ Examples:
         args.frame_offset = 0
 
     if args.video is None:
-        parser.error("Either --segment_metadata or --video must be provided")
+        parser.error("--video is required (paths are never read from metadata)")
 
     return args
 
@@ -165,8 +171,16 @@ def main():
 
     # Get video info
     video_info = get_video_info(args.video)
+    segment_fps = video_info["fps"]
     print(f"Segment info: {video_info['width']}x{video_info['height']}, "
-          f"{video_info['fps']:.2f} fps, {video_info['total_frames']} frames")
+          f"{segment_fps:.2f} fps, {video_info['total_frames']} frames")
+
+    # Original video FPS (for SRT/mask matching) — may differ from segment FPS
+    original_fps = args.original_fps or segment_fps
+    if original_fps != segment_fps:
+        print(f"Original video FPS: {original_fps:.2f} (segment FPS: {segment_fps:.2f})")
+    else:
+        print(f"Original video FPS: {original_fps:.2f}")
 
     # Determine extraction FPS
     if args.extract_fps:
@@ -178,16 +192,18 @@ def main():
         if os.path.exists(metadata_path):
             with open(metadata_path, "r") as f:
                 sam3_metadata = json.load(f)
-            target_fps = sam3_metadata.get("fps", sam3_metadata.get("effective_fps", video_info["fps"]))
+            target_fps = sam3_metadata.get("fps", sam3_metadata.get("effective_fps", segment_fps))
             print(f"Using FPS from SAM3 metadata: {target_fps}")
         else:
-            target_fps = video_info["fps"]
+            target_fps = segment_fps
     else:
-        target_fps = video_info["fps"]
+        target_fps = segment_fps
 
     print(f"Extraction FPS: {target_fps}")
 
-    # Extract frames and apply offset
+    # Extract frames — maintain two index sets:
+    #   segment_frame_indices: relative to segment video (for SAM3 mask matching)
+    #   srt_frame_indices:     relative to original video (for DJI SRT telemetry)
     with VideoFrameContext(
         args.video,
         target_fps=target_fps,
@@ -195,16 +211,18 @@ def main():
         keep_frames=args.keep_frames,
     ) as ctx:
         image_paths = ctx.frame_paths
-        frame_indices = ctx.frame_indices
+        segment_frame_indices = ctx.frame_indices
 
         print(f"Extracted {len(image_paths)} frames")
-        print(f"Segment frame indices: {frame_indices[:5]}{'...' if len(frame_indices) > 5 else ''}")
+        print(f"Segment frame indices: {segment_frame_indices[:5]}{'...' if len(segment_frame_indices) > 5 else ''}")
 
-        # Apply frame offset for SRT matching
+        # Compute SRT-aligned indices by applying frame offset
         if args.frame_offset:
-            frame_indices = [idx + args.frame_offset for idx in frame_indices]
-            print(f"Applied frame offset {args.frame_offset}: "
-                  f"SRT-aligned indices {frame_indices[0]}-{frame_indices[-1]}")
+            srt_frame_indices = [idx + args.frame_offset for idx in segment_frame_indices]
+            print(f"SRT frame indices (offset {args.frame_offset}): "
+                  f"{srt_frame_indices[0]}-{srt_frame_indices[-1]}")
+        else:
+            srt_frame_indices = segment_frame_indices
 
         # Run inference
         predictions, timing = run_inference(image_paths, device)
@@ -231,13 +249,15 @@ def main():
 
             format_info = detect_sam3_format(args.sam3_masks)
 
+            # Use segment-relative indices for mask matching (masks are named
+            # by segment frame numbers, e.g., frame_000000, frame_000003, ...)
             if format_info["format"] == "multi_class":
                 if class_names is None:
                     print(f"Auto-loading all {len(format_info['classes'])} class(es)")
                 masks_data = load_sam3_masks_multi_class(
                     sam3_output_dir=args.sam3_masks,
-                    extracted_frame_indices=frame_indices,
-                    video_fps=video_info["fps"],
+                    extracted_frame_indices=segment_frame_indices,
+                    video_fps=segment_fps,
                     sam3_fps=args.sam3_fps or target_fps,
                     class_names=class_names,
                     direct_frame_match=True,
@@ -245,15 +265,15 @@ def main():
             else:
                 masks_data = load_sam3_masks(
                     sam3_output_dir=args.sam3_masks,
-                    extracted_frame_indices=frame_indices,
-                    video_fps=video_info["fps"],
+                    extracted_frame_indices=segment_frame_indices,
+                    video_fps=segment_fps,
                     sam3_fps=args.sam3_fps or target_fps,
                     class_name=args.object_class,
                     direct_frame_match=True,
                     auto_detect_format=False,
                 )
 
-        # Run tracking
+        # Run tracking — use SRT-aligned indices for DJI telemetry matching
         if masks_data:
             run_tracking(
                 args.output_dir,
@@ -266,7 +286,7 @@ def main():
                 max_missing_frames=args.max_missing_frames,
                 dormant_timeout=args.dormant_timeout,
                 use_point_map=args.use_point_map,
-                frame_indices=frame_indices,
+                frame_indices=srt_frame_indices,
             )
 
     total_time = time.time() - t0
@@ -280,8 +300,10 @@ def main():
         "output_dir": os.path.abspath(args.output_dir),
         "num_frames": len(image_paths),
         "image_files": [os.path.basename(f) for f in image_paths],
-        "frame_indices": frame_indices,
-        "video_fps": video_info["fps"],
+        "segment_frame_indices": segment_frame_indices,
+        "srt_frame_indices": srt_frame_indices,
+        "segment_fps": segment_fps,
+        "original_fps": original_fps,
         "extraction_fps": target_fps,
         "settings": {
             "num_images": args.num_images,
