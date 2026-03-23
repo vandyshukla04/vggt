@@ -203,8 +203,10 @@ def main():
                 break
 
         if sam3_metadata:
-            target_fps = sam3_metadata.get("fps", sam3_metadata.get("effective_fps", segment_fps))
-            print(f"Using FPS from SAM3 metadata: {target_fps}")
+            # Prefer effective_fps (accounts for frame stride) over raw fps
+            target_fps = sam3_metadata.get("effective_fps", sam3_metadata.get("fps", segment_fps))
+            print(f"Using FPS from SAM3 metadata: {target_fps}"
+                  f" (stride: {sam3_metadata.get('frame_stride', 'N/A')})")
         else:
             print(f"WARNING: No SAM3 metadata.json found in {args.sam3_masks}, using segment FPS")
             target_fps = segment_fps
