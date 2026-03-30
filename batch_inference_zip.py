@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Run VGGT inference and 3D tracking on zipped video segments with SAM3 masks.
+Run VGGT inference and 3D tracking on video segments with SAM3 masks.
 
-Takes a zip containing pre-extracted frame segments with SAM3 masks
-(from sam3/scripts/generate_sam3_masks.py), runs VGGT to get depth/cameras/3D
-points, then runs tracking with DJI SRT gimbal grounding to produce
-KITTI-format 3D bounding box labels.
+Takes a directory (or zip) containing pre-extracted frame segments with SAM3
+masks (from sam3/scripts/generate_sam3_masks.py), runs VGGT to get
+depth/cameras/3D points, then runs tracking with DJI SRT gimbal grounding
+to produce KITTI-format 3D bounding box labels.
 
-Input zip structure (after SAM3 mask generation):
+Input structure (directory or zip):
     vid1/
         vid1.SRT
         seg1/
@@ -30,9 +30,16 @@ Output adds per segment:
         vggt_metadata.json
 
 Usage:
+    # Directory input/output (recommended for inspecting intermediate results)
+    python batch_inference_zip.py \
+        --input-dir /path/to/segments_with_masks/ \
+        --output-dir /path/to/output/ \
+        --conf-threshold 50.0
+
+    # Zip input (extracts to output-dir, results saved in place)
     python batch_inference_zip.py \
         --input-zip /path/to/segments_with_masks.zip \
-        --output-zip /path/to/segments_annotated.zip \
+        --output-dir /path/to/output/ \
         --conf-threshold 50.0
 """
 
@@ -43,7 +50,6 @@ import json
 import os
 import shutil
 import sys
-import tempfile
 import time
 import zipfile
 from datetime import datetime
@@ -72,12 +78,15 @@ from vggt.utils.sam3_mask_loader import (
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Run VGGT inference + tracking on zipped video segments"
+        description="Run VGGT inference + tracking on video segments"
     )
-    parser.add_argument("--input-zip", type=str, required=True,
-                        help="Path to input zip (with SAM3 masks)")
-    parser.add_argument("--output-zip", type=str, required=True,
-                        help="Path to output zip (with VGGT results added)")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--input-zip", type=str, default=None,
+                             help="Path to input zip (extracted to --output-dir)")
+    input_group.add_argument("--input-dir", type=str, default=None,
+                             help="Path to input directory (used directly, or copied to --output-dir)")
+    parser.add_argument("--output-dir", type=str, required=True,
+                        help="Output directory for results (segments + vggt_results/)")
     parser.add_argument("--conf-threshold", type=float, default=50.0,
                         help="Confidence percentile for point cloud filtering (default: 50.0)")
     parser.add_argument("--max-distance", type=float, default=8.0,
@@ -405,18 +414,41 @@ def run_segment_tracking(output_dir: str, predictions_cpu: dict,
 def main():
     args = parse_args()
 
-    if not os.path.isfile(args.input_zip):
-        print(f"Input zip not found: {args.input_zip}")
-        sys.exit(1)
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
 
-    # Unzip
-    work_dir = tempfile.mkdtemp(prefix="vggt_work_")
-    print(f"Extracting {args.input_zip} to {work_dir}...")
-    with zipfile.ZipFile(args.input_zip, "r") as zf:
-        zf.extractall(work_dir)
+    # Resolve input → work_dir
+    work_dir = os.path.abspath(args.output_dir)
+
+    if args.input_zip:
+        if not os.path.isfile(args.input_zip):
+            print(f"Input zip not found: {args.input_zip}")
+            sys.exit(1)
+        os.makedirs(work_dir, exist_ok=True)
+        print(f"Extracting {args.input_zip} to {work_dir}...")
+        with zipfile.ZipFile(args.input_zip, "r") as zf:
+            zf.extractall(work_dir)
+    elif args.input_dir:
+        input_dir = os.path.abspath(args.input_dir)
+        if not os.path.isdir(input_dir):
+            print(f"Input directory not found: {input_dir}")
+            sys.exit(1)
+        if input_dir != work_dir:
+            # Copy input to output dir so results are saved alongside data
+            print(f"Copying {input_dir} to {work_dir}...")
+            if os.path.exists(work_dir):
+                # Merge into existing output dir (resume-friendly)
+                for item in os.listdir(input_dir):
+                    src = os.path.join(input_dir, item)
+                    dst = os.path.join(work_dir, item)
+                    if os.path.isdir(src) and not os.path.exists(dst):
+                        shutil.copytree(src, dst)
+                    elif os.path.isfile(src) and not os.path.exists(dst):
+                        shutil.copy2(src, dst)
+            else:
+                shutil.copytree(input_dir, work_dir)
+        else:
+            print(f"Input and output are the same directory: {work_dir}")
 
     # Discover segments
     segments = discover_segments(work_dir)
@@ -596,25 +628,10 @@ def main():
         torch.cuda.empty_cache()
         gc.collect()
 
-    # Create output zip (exclude predictions.pt)
-    print(f"Creating output zip: {args.output_zip}...")
-    with zipfile.ZipFile(args.output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
-        for root, dirs, files in os.walk(work_dir):
-            for file in files:
-                # Skip predictions.pt (too large, not needed)
-                if file == "predictions.pt":
-                    continue
-                file_path = os.path.join(root, file)
-                arcname = os.path.relpath(file_path, work_dir)
-                zf.write(file_path, arcname)
-
-    # Clean up
-    print(f"Cleaning up {work_dir}...")
-    shutil.rmtree(work_dir)
-
     print(f"\nDone. Processed {total_processed} segment(s), "
           f"skipped {total_skipped}, {total_tracks} total tracks.")
-    print(f"Output: {args.output_zip}")
+    print(f"Results saved to: {work_dir}")
+    print(f"\nTo zip results: python zip_results.py --input-dir {work_dir} --output-zip output.zip")
 
 
 if __name__ == "__main__":
