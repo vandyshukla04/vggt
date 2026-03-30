@@ -2,7 +2,10 @@
   "permissions": {
     "allow": [
       "Read(//home/shuklva/CUT3R/examples/wd_data/rhinos_cami/rhin-30_2/**)",
-      "Read(//home/shuklva/CUT3R/examples/wd_data/zebras_KABR/zebr-13_1_5/**)"
+      "Read(//home/shuklva/CUT3R/examples/wd_data/zebras_KABR/zebr-13_1_5/**)",
+      "Bash(grep -r \"stride\\\\|sequence\\\\|length\\\\|max.*frame\\\\|frame.*max\" /home/shuklva/vggt/batch_inference*.py /home/shuklva/vggt/demo*.py)",
+      "Bash(grep -r \"150\\\\|200\\\\|frame.*limit\\\\|max.*frame\" /home/shuklva/vggt/*.py)",
+      "Bash(grep -r \"memory\\\\|cuda\\\\|device\\\\|gpu\" /home/shuklva/vggt/batch_inference*.py)"
     ]
   }
 }
