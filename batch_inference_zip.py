@@ -544,7 +544,7 @@ def main():
                 if format_info["format"] == "multi_class":
                     masks_data = load_sam3_masks_multi_class(
                         sam3_output_dir=sam3_masks_dir,
-                        extracted_frame_indices=list(range(len(image_paths))),
+                        extracted_frame_indices=frame_indices,
                         video_fps=extract_fps,
                         sam3_fps=extract_fps,
                         class_names=class_names,
@@ -553,7 +553,7 @@ def main():
                 else:
                     masks_data = load_sam3_masks(
                         sam3_output_dir=sam3_masks_dir,
-                        extracted_frame_indices=list(range(len(image_paths))),
+                        extracted_frame_indices=frame_indices,
                         video_fps=extract_fps,
                         sam3_fps=extract_fps,
                         class_name=args.object_class,
