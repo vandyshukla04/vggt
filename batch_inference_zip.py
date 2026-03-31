@@ -456,11 +456,17 @@ def main():
         if not os.path.isdir(input_dir):
             print(f"Input directory not found: {input_dir}")
             sys.exit(1)
-        if input_dir != work_dir:
-            # Copy input to output dir so results are saved alongside data
+        if input_dir == work_dir:
+            print(f"Working in-place: {work_dir}")
+        elif args.segment:
+            # When targeting a specific segment, work in-place on input dir
+            # to avoid copying everything. Results are saved into input_dir.
+            work_dir = input_dir
+            print(f"Working in-place on input dir (--segment mode): {work_dir}")
+        else:
+            # Full run: copy input to output dir so results are saved alongside data
             print(f"Copying {input_dir} to {work_dir}...")
             if os.path.exists(work_dir):
-                # Merge into existing output dir (resume-friendly)
                 for item in os.listdir(input_dir):
                     src = os.path.join(input_dir, item)
                     dst = os.path.join(work_dir, item)
@@ -470,8 +476,6 @@ def main():
                         shutil.copy2(src, dst)
             else:
                 shutil.copytree(input_dir, work_dir)
-        else:
-            print(f"Input and output are the same directory: {work_dir}")
 
     # Discover segments
     segments = discover_segments(work_dir)
