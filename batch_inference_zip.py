@@ -492,7 +492,13 @@ def main():
             if args.segment in f"{os.path.basename(v)}/{os.path.basename(s)}"
         ]
         if not segments:
+            all_ids = [f"{os.path.basename(v)}/{os.path.basename(s)}" for v, s, m in discover_segments(work_dir)]
             print(f"No segments matching '{args.segment}' found")
+            print(f"Available segments ({len(all_ids)}):")
+            for sid in all_ids[:20]:
+                print(f"  {sid}")
+            if len(all_ids) > 20:
+                print(f"  ... and {len(all_ids) - 20} more")
             sys.exit(1)
         print(f"Filtered to {len(segments)} matching segment(s)\n")
 
@@ -642,6 +648,9 @@ def main():
                     "max_distance": args.max_distance,
                     "use_point_map": args.use_point_map,
                     "object_class": args.object_class,
+                    "outlier_factor": args.outlier_factor,
+                    "bbox_percentile": args.bbox_percentile,
+                    "point_conf_threshold": args.point_conf_threshold,
                 },
                 "timing": timing,
                 "total_time": round(time.time() - t0, 2),
