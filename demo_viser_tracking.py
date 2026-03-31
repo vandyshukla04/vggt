@@ -672,8 +672,15 @@ def load_grounded_sam_masks(mask_dir: str, img_paths: List[str]) -> Dict[int, Li
 # 3D BBox Computation
 # =============================================================================
 
-def compute_oriented_bbox_pca(points_3d: np.ndarray) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Compute oriented bounding box using PCA (numpy SVD implementation)."""
+def compute_oriented_bbox_pca(points_3d: np.ndarray, bbox_percentile: float = 100.0) -> Optional[Tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Compute oriented bounding box using PCA (numpy SVD implementation).
+
+    Args:
+        points_3d: (N, 3) array of 3D points.
+        bbox_percentile: Percentile of points to include along each PCA axis.
+            100 = use min/max (default). 95 = use 2.5th/97.5th percentiles,
+            trimming the most extreme 5% of points in PCA space.
+    """
     if len(points_3d) < 3:
         return None
 
@@ -686,8 +693,14 @@ def compute_oriented_bbox_pca(points_3d: np.ndarray) -> Optional[Tuple[np.ndarra
 
     # Transform points to PCA space
     transformed_points = centered_points @ components.T
-    min_vals = np.min(transformed_points, axis=0)
-    max_vals = np.max(transformed_points, axis=0)
+    if bbox_percentile < 100.0:
+        lo = (100.0 - bbox_percentile) / 2.0
+        hi = 100.0 - lo
+        min_vals = np.percentile(transformed_points, lo, axis=0)
+        max_vals = np.percentile(transformed_points, hi, axis=0)
+    else:
+        min_vals = np.min(transformed_points, axis=0)
+        max_vals = np.max(transformed_points, axis=0)
     dimensions = max_vals - min_vals
 
     # Center in PCA space, then transform back to world
@@ -876,7 +889,11 @@ def transform_mask_to_model_coordinates(mask: np.ndarray, original_shape: Tuple[
 def compute_instance_bboxes(world_points: np.ndarray, masks_data: Dict[int, List[Dict]],
                             original_images: List[np.ndarray], model_size: Tuple[int, int],
                             tracker: ImprovedTracker,
-                            gimbal_data: Optional[Dict] = None) -> List[List[BoundingBox3D]]:
+                            gimbal_data: Optional[Dict] = None,
+                            point_conf: Optional[np.ndarray] = None,
+                            point_conf_threshold: float = 0.0,
+                            outlier_factor: float = 1.5,
+                            bbox_percentile: float = 100.0) -> List[List[BoundingBox3D]]:
     """Compute 3D bounding boxes for all instances across frames and apply tracking.
 
     Args:
@@ -886,6 +903,10 @@ def compute_instance_bboxes(world_points: np.ndarray, masks_data: Dict[int, List
         model_size: (H, W) tuple of model output size
         tracker: ImprovedTracker instance
         gimbal_data: Optional dict of gimbal data for ground plane alignment
+        point_conf: Optional confidence map (S, H, W) for filtering low-confidence points
+        point_conf_threshold: Minimum confidence to keep a point (0.0 = no filtering)
+        outlier_factor: IQR multiplier for outlier removal (1.5 = default, lower = tighter)
+        bbox_percentile: Percentile trim in PCA space (100 = min/max, 95 = trim 5%)
     """
     all_bboxes = []
     S, H, W, _ = world_points.shape
@@ -939,17 +960,23 @@ def compute_instance_bboxes(world_points: np.ndarray, masks_data: Dict[int, List
             # Get 3D points for this instance
             instance_points = pts3d[mask_transformed]
 
+            # Filter by point confidence if available
+            if point_conf is not None and point_conf_threshold > 0:
+                conf_values = point_conf[frame_idx][mask_transformed]
+                keep = conf_values >= point_conf_threshold
+                instance_points = instance_points[keep]
+
             if len(instance_points) < 10:
                 continue
 
             # Filter outliers
-            filtered_points = filter_outliers(instance_points)
+            filtered_points = filter_outliers(instance_points, outlier_factor=outlier_factor)
 
             if len(filtered_points) < 5:
                 continue
 
             # Compute oriented bounding box
-            bbox_result = compute_oriented_bbox_pca(filtered_points)
+            bbox_result = compute_oriented_bbox_pca(filtered_points, bbox_percentile=bbox_percentile)
             if bbox_result is None:
                 continue
 

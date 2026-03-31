@@ -103,6 +103,17 @@ def parse_args():
                         help="Use point map instead of depth-based points")
     parser.add_argument("--skip-tracking", action="store_true",
                         help="Skip tracking (geometry only: cameras, depth, point cloud)")
+    parser.add_argument("--segment", type=str, default=None,
+                        help="Process only this segment (e.g., 'DJI_.../seg1'). "
+                             "Forces reprocessing even if already complete.")
+    parser.add_argument("--outlier-factor", type=float, default=1.5,
+                        help="IQR multiplier for outlier removal (default: 1.5, try 0.75 for tighter boxes)")
+    parser.add_argument("--bbox-percentile", type=float, default=100.0,
+                        help="Percentile of points to include in PCA bbox (default: 100 = min/max, "
+                             "try 95 to trim extreme 5%%)")
+    parser.add_argument("--point-conf-threshold", type=float, default=0.0,
+                        help="Min confidence for 3D points used in bbox fitting "
+                             "(default: 0.0 = no filtering, try 0.3)")
     return parser.parse_args()
 
 
@@ -302,7 +313,10 @@ def run_segment_tracking(output_dir: str, predictions_cpu: dict,
                          image_paths: List[str], masks_data: dict,
                          srt_path: Optional[str], frame_indices: List[int],
                          max_distance: float, max_missing_frames: int,
-                         dormant_timeout: int, use_point_map: bool):
+                         dormant_timeout: int, use_point_map: bool,
+                         outlier_factor: float = 1.5,
+                         bbox_percentile: float = 100.0,
+                         point_conf_threshold: float = 0.0):
     """Run tracking pipeline on a segment's predictions."""
     from demo_viser_tracking import (
         compute_instance_bboxes,
@@ -362,11 +376,20 @@ def run_segment_tracking(output_dir: str, predictions_cpu: dict,
         dormant_timeout=dormant_timeout,
     )
 
+    # Resolve point confidence map for filtering
+    pc = None
+    if point_conf_threshold > 0:
+        pc = depth_conf  # (S, H, W)
+
     # Compute 3D bounding boxes
     model_size = (depth.shape[1], depth.shape[2])
     bounding_boxes = compute_instance_bboxes(
         world_points, masks_data, original_images, model_size, tracker,
         gimbal_data=gimbal_data,
+        point_conf=pc,
+        point_conf_threshold=point_conf_threshold,
+        outlier_factor=outlier_factor,
+        bbox_percentile=bbox_percentile,
     )
 
     # Collect track IDs
@@ -456,8 +479,18 @@ def main():
 
     if not segments:
         print("No segments found.")
-        shutil.rmtree(work_dir)
         sys.exit(1)
+
+    # Filter to single segment if requested
+    if args.segment:
+        segments = [
+            (v, s, m) for v, s, m in segments
+            if args.segment in f"{os.path.basename(v)}/{os.path.basename(s)}"
+        ]
+        if not segments:
+            print(f"No segments matching '{args.segment}' found")
+            sys.exit(1)
+        print(f"Filtered to {len(segments)} matching segment(s)\n")
 
     # Progress
     run_params = {
@@ -481,13 +514,13 @@ def main():
             video_name = os.path.basename(video_dir)
             seg_id = f"{video_name}/{seg_name}"
 
-            # Check if already complete
-            if seg_id in completed and is_segment_vggt_complete(seg_dir):
+            # Check if already complete (skip check when --segment forces reprocessing)
+            if not args.segment and seg_id in completed and is_segment_vggt_complete(seg_dir):
                 print(f"[{seg_id}] SKIP (already complete)")
                 total_skipped += 1
                 continue
 
-            # Clean up incomplete results
+            # Clean up existing results (always when --segment, or if incomplete)
             results_dir = os.path.join(seg_dir, "vggt_results")
             if os.path.isdir(results_dir):
                 shutil.rmtree(results_dir)
@@ -579,6 +612,9 @@ def main():
                         max_missing_frames=args.max_missing_frames,
                         dormant_timeout=args.dormant_timeout,
                         use_point_map=args.use_point_map,
+                        outlier_factor=args.outlier_factor,
+                        bbox_percentile=args.bbox_percentile,
+                        point_conf_threshold=args.point_conf_threshold,
                     )
                 else:
                     print(f"    No masks loaded from {sam3_masks_dir}")
