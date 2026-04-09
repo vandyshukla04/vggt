@@ -198,6 +198,10 @@ class VGGTBBoxEditor:
         self.scene_pcd_points = None
         self.scene_pcd_colors = None
 
+        # Frame images directory (for point cloud colors + 2D panel)
+        self.frames_dir = self._auto_find_frames_dir()
+        self.frame_image_cache = {}  # frame_idx -> (H, W, 3) uint8 RGB
+
         # Viser server
         self.server = viser.ViserServer(port=port, verbose=False)
         self.server.scene.set_up_direction("-y")
@@ -361,6 +365,89 @@ class VGGTBBoxEditor:
         else:
             print("depth_maps.npz not found — will use scene PLY")
 
+    def _auto_find_frames_dir(self):
+        """Find directory containing extracted frame images (frame_XXXXXX.jpg).
+
+        Search order:
+        1. result_dir parent (seg1/ typically has frames alongside vggt_results/)
+        2. result_dir/images/
+        3. result_dir/frames/
+        """
+        # Check parent directory (most common layout)
+        parent = self.result_dir.parent
+        if self.frame_numbers:
+            test_name = f"frame_{self.frame_numbers[0]:06d}.jpg"
+            if (parent / test_name).exists():
+                print(f"Frame images: {parent}")
+                return parent
+
+        # Check subdirectories
+        for subdir in ["images", "frames"]:
+            candidate = self.result_dir / subdir
+            if candidate.exists() and self.frame_numbers:
+                test_name = f"frame_{self.frame_numbers[0]:06d}.jpg"
+                if (candidate / test_name).exists():
+                    print(f"Frame images: {candidate}")
+                    return candidate
+
+        print("Frame images directory not found (point cloud will be gray, 2D panel disabled)")
+        return None
+
+    def _load_frame_image(self, frame_idx, target_size=None):
+        """Load frame image as RGB numpy array.
+
+        Args:
+            frame_idx: Sequential frame index (0-199)
+            target_size: Optional (H, W) to resize to. If None, returns original size.
+
+        Returns:
+            (H, W, 3) uint8 RGB array, or None
+        """
+        cache_key = (frame_idx, target_size)
+        if cache_key in self.frame_image_cache:
+            return self.frame_image_cache[cache_key]
+
+        # Limit cache to avoid memory bloat (keep model-res images, evict full-res)
+        if len(self.frame_image_cache) > 400:
+            # Evict full-resolution entries (target_size=None)
+            to_evict = [k for k in self.frame_image_cache if k[1] is None]
+            for k in to_evict[:len(to_evict)//2]:
+                del self.frame_image_cache[k]
+
+        if self.frames_dir is None or frame_idx >= len(self.frame_numbers):
+            return None
+
+        orig_frame = self.frame_numbers[frame_idx]
+        img_path = self.frames_dir / f"frame_{orig_frame:06d}.jpg"
+        if not img_path.exists():
+            img_path = self.frames_dir / f"frame_{orig_frame:06d}.png"
+        if not img_path.exists():
+            return None
+
+        try:
+            if HAS_CV2:
+                bgr = cv2.imread(str(img_path))
+                if bgr is None:
+                    return None
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            else:
+                from PIL import Image
+                rgb = np.array(Image.open(img_path).convert('RGB'))
+
+            if target_size is not None:
+                h, w = target_size
+                if HAS_CV2:
+                    rgb = cv2.resize(rgb, (w, h), interpolation=cv2.INTER_LINEAR)
+                else:
+                    from PIL import Image
+                    rgb = np.array(Image.fromarray(rgb).resize((w, h), Image.BILINEAR))
+
+            self.frame_image_cache[cache_key] = rgb
+            return rgb
+        except Exception as e:
+            print(f"Failed to load frame image {img_path}: {e}")
+            return None
+
     def _load_point_cloud(self, frame_idx):
         """Load/generate point cloud for a frame."""
         if frame_idx in self.point_clouds:
@@ -416,8 +503,15 @@ class VGGTBBoxEditor:
             combined_mask = valid_mask
 
         points = world_points[combined_mask].reshape(-1, 3)
-        # Use gray colors (no image data loaded)
-        colors = np.ones((len(points), 3)) * 0.6
+
+        # Get colors from frame image (resized to model resolution)
+        model_h, model_w = depth.shape[:2]
+        frame_img = self._load_frame_image(frame_idx, target_size=(model_h, model_w))
+        if frame_img is not None:
+            # frame_img is (H, W, 3) uint8 RGB, same shape as depth
+            colors = frame_img.reshape(-1, 3)[combined_mask.reshape(-1)] / 255.0
+        else:
+            colors = np.ones((len(points), 3)) * 0.6
 
         return points, colors
 
@@ -598,8 +692,22 @@ class VGGTBBoxEditor:
         """Setup all GUI controls."""
         gui = self.server.gui
 
+        # Widen the GUI panel (default "medium"=20em, "large"=24em — 1.2x wider)
+        gui.configure_theme(control_width="large", dark_mode=True)
+
+        # --- 2D Image Panel (TOP — always visible) ---
+        with gui.add_folder("2D View", expand_by_default=True):
+            placeholder = np.zeros((180, 320, 3), dtype=np.uint8)
+            self.image_panel = gui.add_image(
+                placeholder, label="Current Frame", format="jpeg", jpeg_quality=85
+            )
+            self.image_panel_comparison = gui.add_image(
+                placeholder, label="Before / After", format="jpeg", jpeg_quality=85,
+                visible=False
+            )
+
         # --- Navigation ---
-        with gui.add_folder("Navigation"):
+        with gui.add_folder("Navigation", expand_by_default=False):
             prev_btn = gui.add_button("Prev Frame")
             next_btn = gui.add_button("Next Frame")
 
@@ -638,7 +746,7 @@ class VGGTBBoxEditor:
                 self._render_frame()
 
         # --- Track Selection ---
-        with gui.add_folder("Track Selection"):
+        with gui.add_folder("Track Selection", expand_by_default=False):
             all_tracks = set()
             for bboxes in self.auto_bboxes.values():
                 for bbox in bboxes:
@@ -657,7 +765,7 @@ class VGGTBBoxEditor:
             self._render_frame()
 
         # --- Point Cloud ---
-        with gui.add_folder("Point Cloud"):
+        with gui.add_folder("Point Cloud", expand_by_default=False):
             self.point_size_slider = gui.add_slider(
                 "Point Size", min=0.001, max=0.05, step=0.001, initial_value=0.005
             )
@@ -675,7 +783,7 @@ class VGGTBBoxEditor:
             self._render_frame()
 
         # --- Bbox Editing ---
-        with gui.add_folder("Bbox Editing"):
+        with gui.add_folder("Bbox Editing", expand_by_default=False):
             self.dim_0_slider = gui.add_slider("dim[0]", min=0.001, max=2.0, step=0.001, initial_value=0.1)
             self.dim_1_slider = gui.add_slider("dim[1]", min=0.001, max=2.0, step=0.001, initial_value=0.1)
             self.dim_2_slider = gui.add_slider("dim[2]", min=0.001, max=2.0, step=0.001, initial_value=0.1)
@@ -705,7 +813,7 @@ class VGGTBBoxEditor:
             self._snap_to_proportions()
 
         # --- Ground Snapping ---
-        with gui.add_folder("Ground Snapping"):
+        with gui.add_folder("Ground Snapping", expand_by_default=False):
             self.ground_method_dropdown = gui.add_dropdown(
                 "Ground Method",
                 options=["RANSAC (robust)", "Lowest Points", "Track Points"],
@@ -723,7 +831,7 @@ class VGGTBBoxEditor:
             self._snap_to_ground_all_frames()
 
         # --- Copy / Propagate ---
-        with gui.add_folder("Copy / Propagate"):
+        with gui.add_folder("Copy / Propagate", expand_by_default=False):
             copy_prev_btn = gui.add_button("Copy from Previous Frame")
             copy_next_btn = gui.add_button("Copy from Next Frame")
             propagate_btn = gui.add_button("Propagate to All Frames")
@@ -741,7 +849,7 @@ class VGGTBBoxEditor:
             self._propagate_to_all_frames()
 
         # --- Keyframe Interpolation ---
-        with gui.add_folder("Keyframe Interpolation"):
+        with gui.add_folder("Keyframe Interpolation", expand_by_default=False):
             kf1_btn = gui.add_button("Mark as Keyframe 1")
             kf2_btn = gui.add_button("Mark as Keyframe 2")
             interp_btn = gui.add_button("Interpolate Between Keyframes")
@@ -774,7 +882,7 @@ class VGGTBBoxEditor:
                 self.confirm_interpolate_btn.visible = False
 
         # --- Semantic Faces ---
-        with gui.add_folder("Semantic Face Labels"):
+        with gui.add_folder("Semantic Face Labels", expand_by_default=False):
             face_options = ["(None)"] + [f"Face {i}" for i in range(6)]
             self.front_face_dropdown = gui.add_dropdown("Front Face", options=face_options, initial_value="(None)")
             self.top_face_dropdown = gui.add_dropdown("Top Face", options=face_options, initial_value="(None)")
@@ -796,7 +904,7 @@ class VGGTBBoxEditor:
                 self._auto_apply_semantic_labels()
 
         # --- Save / Compare ---
-        with gui.add_folder("Save / Compare"):
+        with gui.add_folder("Save / Compare", expand_by_default=False):
             save_btn = gui.add_button("Save Now")
             next_unann_btn = gui.add_button("Next Unannotated Frame")
             self.show_original_checkbox = gui.add_checkbox("Show Original Bboxes", initial_value=False)
@@ -812,6 +920,215 @@ class VGGTBBoxEditor:
         @self.show_original_checkbox.on_update
         def _(_):
             self._render_frame()
+
+    # ======================================================================
+    # 2D Image Panel
+    # ======================================================================
+
+    def _project_bbox_to_2d(self, bbox, frame_idx, img_shape):
+        """Project a 3D bbox onto a 2D image. Returns list of (pt1, pt2) edge pairs in pixel coords."""
+        if self.cam_params is None or frame_idx >= len(self.cam_params['extrinsics']):
+            return None
+
+        ext = self.cam_params['extrinsics'][frame_idx]  # (3, 4) w2c
+        intr = self.cam_params['intrinsics'][frame_idx]  # (3, 3)
+
+        img_h, img_w = img_shape[:2]
+        model_h = self.cam_params['image_height']
+        model_w = self.cam_params['image_width']
+
+        # Scale intrinsics to image resolution
+        K = intr.copy()
+        K[0, :] *= img_w / model_w
+        K[1, :] *= img_h / model_h
+
+        corners_3d = bbox.get_corners()
+        corners_h = np.concatenate([corners_3d, np.ones((8, 1))], axis=1)
+        corners_cam = (ext @ corners_h.T).T  # (8, 3)
+
+        # All corners must be in front of camera
+        if not np.all(corners_cam[:, 2] > 0.01):
+            return None
+
+        proj = (K @ corners_cam.T).T
+        corners_2d = (proj[:, :2] / proj[:, 2:3]).astype(int)
+        return corners_2d
+
+    def _draw_bbox_on_image(self, img, bbox, frame_idx, color=(0, 255, 0), thickness=2, label=None):
+        """Draw a 3D bbox wireframe projected onto a 2D image (in-place)."""
+        if not HAS_CV2:
+            return
+        corners_2d = self._project_bbox_to_2d(bbox, frame_idx, img.shape)
+        if corners_2d is None:
+            return
+
+        for si, ei in bbox.get_edges():
+            pt1 = tuple(corners_2d[si])
+            pt2 = tuple(corners_2d[ei])
+            cv2.line(img, pt1, pt2, color, thickness)
+
+        if label:
+            center_2d = corners_2d.mean(axis=0).astype(int)
+            cv2.putText(img, label, tuple(center_2d),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 3)
+            cv2.putText(img, label, tuple(center_2d),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+
+    def _draw_semantic_faces_on_image(self, img, bbox, frame_idx, track_id, alpha=0.35):
+        """Draw color-coded semantic face overlays on a BGR image (in-place).
+
+        Colors: front=red, top=green, left=blue (BGR for cv2).
+        """
+        if not HAS_CV2:
+            return
+
+        # Get semantic labels for this track/frame
+        if track_id not in self.semantic_faces:
+            return
+        labels = self.semantic_faces[track_id].get(frame_idx)
+        if not labels:
+            return
+
+        corners_2d = self._project_bbox_to_2d(bbox, frame_idx, img.shape)
+        if corners_2d is None:
+            return
+
+        face_corner_indices = {
+            0: [0, 1, 5, 4], 1: [2, 3, 7, 6], 2: [0, 3, 7, 4],
+            3: [1, 2, 6, 5], 4: [4, 5, 6, 7], 5: [0, 1, 2, 3],
+        }
+        # BGR colors for cv2
+        semantic_colors_bgr = {
+            'front': (0, 0, 255),    # Red
+            'top':   (0, 200, 0),    # Green
+            'left':  (255, 0, 0),    # Blue
+        }
+        semantic_labels_text = {'front': 'FRONT', 'top': 'TOP', 'left': 'LEFT'}
+
+        for sem_name, face_id in labels.items():
+            if sem_name not in semantic_colors_bgr:
+                continue
+            if face_id not in face_corner_indices:
+                continue
+
+            cidxs = face_corner_indices[face_id]
+            face_pts = corners_2d[cidxs]
+
+            color = semantic_colors_bgr[sem_name]
+
+            # Semi-transparent fill
+            overlay = img.copy()
+            cv2.fillPoly(overlay, [face_pts], color)
+            cv2.addWeighted(overlay, alpha, img, 1 - alpha, 0, img)
+
+            # Edge outline
+            cv2.polylines(img, [face_pts], isClosed=True, color=color, thickness=2)
+
+            # Label text at face center
+            face_center = face_pts.mean(axis=0).astype(int)
+            text = semantic_labels_text[sem_name]
+            cv2.putText(img, text, tuple(face_center),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 2)
+            cv2.putText(img, text, tuple(face_center),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+
+    def _update_2d_panel(self):
+        """Update the 2D image panel with current frame + bbox projections + semantic faces."""
+        if not HAS_CV2 or self.frames_dir is None:
+            return
+
+        # Load original resolution image
+        frame_img = self._load_frame_image(self.current_frame)
+        if frame_img is None:
+            return
+
+        # Work on a copy in BGR for cv2 drawing
+        img = cv2.cvtColor(frame_img, cv2.COLOR_RGB2BGR)
+
+        # Draw all bboxes or just selected track
+        frame_bboxes = self.auto_bboxes.get(self.current_frame, [])
+        has_correction = False
+
+        for bbox in frame_bboxes:
+            if self.selected_track is not None and bbox.track_id != self.selected_track:
+                continue
+
+            # Determine which bbox to draw (corrected or original)
+            if self._has_correction(bbox.track_id, self.current_frame):
+                draw_bbox = self.corrections[bbox.track_id][self.current_frame]
+                self._draw_bbox_on_image(img, draw_bbox, self.current_frame,
+                                        color=(0, 255, 0), thickness=3,
+                                        label=f"T{bbox.track_id} [corrected]")
+                has_correction = True
+            else:
+                draw_bbox = bbox
+                self._draw_bbox_on_image(img, draw_bbox, self.current_frame,
+                                        color=(0, 100, 255), thickness=2,
+                                        label=f"T{bbox.track_id}")
+
+            # Draw semantic face overlays
+            self._draw_semantic_faces_on_image(
+                img, draw_bbox, self.current_frame, bbox.track_id
+            )
+
+        # Resize for GUI (keep aspect ratio, max width 640)
+        h, w = img.shape[:2]
+        panel_w = min(800, w)
+        panel_h = int(h * panel_w / w)
+        img_small = cv2.resize(img, (panel_w, panel_h), interpolation=cv2.INTER_AREA)
+
+        # Convert back to RGB for viser
+        self.image_panel.image = cv2.cvtColor(img_small, cv2.COLOR_BGR2RGB)
+
+        # Before/After comparison when corrections exist
+        if has_correction and self.selected_track is not None:
+            self._update_comparison_panel(frame_img, frame_bboxes, panel_w, panel_h)
+            self.image_panel_comparison.visible = True
+        else:
+            self.image_panel_comparison.visible = False
+
+    def _update_comparison_panel(self, frame_img_rgb, frame_bboxes, panel_w, panel_h):
+        """Render side-by-side before/after comparison image."""
+        if not HAS_CV2:
+            return
+
+        # Find the selected track's original and corrected bboxes
+        original_bbox = next((b for b in frame_bboxes if b.track_id == self.selected_track), None)
+        if original_bbox is None or not self._has_correction(self.selected_track, self.current_frame):
+            return
+
+        corrected_bbox = self.corrections[self.selected_track][self.current_frame]
+
+        # "Before" image — original bbox in red
+        before = cv2.cvtColor(frame_img_rgb, cv2.COLOR_RGB2BGR)
+        self._draw_bbox_on_image(before, original_bbox, self.current_frame,
+                                color=(0, 0, 255), thickness=3, label="ORIGINAL")
+
+        # "After" image — corrected bbox in green
+        after = cv2.cvtColor(frame_img_rgb, cv2.COLOR_RGB2BGR)
+        self._draw_bbox_on_image(after, corrected_bbox, self.current_frame,
+                                color=(0, 255, 0), thickness=3, label="CORRECTED")
+
+        # Resize both
+        half_w = panel_w // 2
+        before_small = cv2.resize(before, (half_w, panel_h), interpolation=cv2.INTER_AREA)
+        after_small = cv2.resize(after, (half_w, panel_h), interpolation=cv2.INTER_AREA)
+
+        # Concatenate side-by-side with a thin white divider
+        divider = np.ones((panel_h, 2, 3), dtype=np.uint8) * 255
+        comparison = np.concatenate([before_small, divider, after_small], axis=1)
+
+        # Add labels
+        cv2.putText(comparison, "BEFORE", (10, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
+        cv2.putText(comparison, "BEFORE", (10, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+        cv2.putText(comparison, "AFTER", (half_w + 12, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 3)
+        cv2.putText(comparison, "AFTER", (half_w + 12, 25),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+
+        self.image_panel_comparison.image = cv2.cvtColor(comparison, cv2.COLOR_BGR2RGB)
 
     # ======================================================================
     # Rendering
@@ -896,6 +1213,7 @@ class VGGTBBoxEditor:
 
         self._update_selection()
         self._update_info_text()
+        self._update_2d_panel()
 
     def _render_bbox(self, bbox):
         """Render a single bbox wireframe."""
@@ -1055,6 +1373,9 @@ class VGGTBBoxEditor:
         else:
             for bbox in frame_bboxes:
                 self._render_bbox(bbox)
+
+        # Update 2D panel to reflect bbox changes
+        self._update_2d_panel()
 
     # ======================================================================
     # Selection & Editing
@@ -1796,6 +2117,9 @@ class VGGTBBoxEditor:
         # 5. Generate 2D projections
         self._generate_2d_projections(updated)
 
+        # 6. Generate semantic face verification images
+        self._generate_semantic_face_images(updated)
+
     def _save_kitti_labels(self, tracking_summary):
         """Regenerate KITTI-format labels from updated tracking summary."""
         if self.cam_params is None:
@@ -1959,6 +2283,64 @@ class VGGTBBoxEditor:
 
                 out_file = vis_dir / f"frame_{orig_frame:06d}.png"
                 cv2.imwrite(str(out_file), img)
+
+    def _generate_semantic_face_images(self, tracking_summary):
+        """Generate verification images with semantic face overlays for all annotated frames."""
+        if not HAS_CV2 or self.frames_dir is None or not self.semantic_faces:
+            return
+
+        vis_dir = self.output_dir / "annotated_2d_semantic"
+        vis_dir.mkdir(exist_ok=True)
+
+        count = 0
+        for track_id, frame_labels in self.semantic_faces.items():
+            track_id_int = int(track_id) if isinstance(track_id, str) else track_id
+            track_key = str(track_id_int)
+            track_data = tracking_summary.get('tracks', {}).get(track_key)
+            if track_data is None:
+                continue
+
+            frame_to_idx = {f: i for i, f in enumerate(track_data['frames'])}
+
+            for frame_idx, labels in frame_labels.items():
+                frame_idx_int = int(frame_idx) if isinstance(frame_idx, str) else frame_idx
+                if frame_idx_int not in frame_to_idx:
+                    continue
+
+                i = frame_to_idx[frame_idx_int]
+                if frame_idx_int >= len(self.cam_params['extrinsics']):
+                    continue
+
+                # Load frame image
+                frame_img = self._load_frame_image(frame_idx_int)
+                if frame_img is None:
+                    continue
+
+                img = cv2.cvtColor(frame_img, cv2.COLOR_RGB2BGR)
+
+                # Build bbox from tracking data
+                center = np.array(track_data['centers'][i])
+                dims = np.array(track_data['dimensions'][i])
+                rot = np.array(track_data['rotation_matrices'][i])
+                class_name = self.detected_class_name or track_data.get('class_name', 'object')
+                bbox = BBox3D(center, dims, rot, class_name, track_id_int, frame_idx_int)
+
+                # Draw bbox wireframe
+                self._draw_bbox_on_image(img, bbox, frame_idx_int,
+                                        color=(0, 255, 0), thickness=2,
+                                        label=f"T{track_id_int}")
+
+                # Draw semantic faces
+                self._draw_semantic_faces_on_image(img, bbox, frame_idx_int, track_id_int)
+
+                # Save
+                orig_frame = self.frame_numbers[frame_idx_int] if frame_idx_int < len(self.frame_numbers) else frame_idx_int
+                out_path = vis_dir / f"frame_{orig_frame:06d}_semantic.png"
+                cv2.imwrite(str(out_path), img)
+                count += 1
+
+        if count > 0:
+            print(f"Saved {count} semantic face verification images to {vis_dir}")
 
     # ======================================================================
     # Main Loop
