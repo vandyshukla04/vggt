@@ -26,6 +26,7 @@ import os
 import shutil
 import sys
 import zipfile
+from typing import Optional
 
 
 def parse_args():
@@ -46,6 +47,13 @@ def parse_args():
                         help="Compute and save dataset statistics alongside the zip")
     parser.add_argument("--stats-only", action="store_true",
                         help="Only compute statistics (no zipping)")
+    parser.add_argument("--include-video", type=str, nargs="*", default=None,
+                        help="Include only these video names (all segments of each). "
+                             "Optional — if omitted, all videos are included.")
+    parser.add_argument("--include-segment", type=str, nargs="*", default=None,
+                        help="Include only these segments, format 'video/segN'. "
+                             "Optional — if omitted, all segments of included videos are kept. "
+                             "Use with --include-video to pick specific segments within a video.")
     return parser.parse_args()
 
 
@@ -107,10 +115,70 @@ def count_kitti_labels(kitti_dir):
     return total_detections, frames_with_labels, class_counts
 
 
-def compute_dataset_stats(input_dir: str) -> dict:
+def segment_passes_filter(video_name: str, seg_name: str,
+                          include_videos: Optional[list],
+                          include_segments: Optional[list]) -> bool:
+    """
+    Return True if this (video, segment) passes the include filters.
+    - If both filters are None, everything passes.
+    - If include_videos given, video must be in it.
+    - If include_segments given, 'video/seg' must be in it.
+    - Both can be combined (AND).
+    """
+    seg_id = f"{video_name}/{seg_name}"
+    if include_videos is not None and video_name not in include_videos:
+        return False
+    if include_segments is not None and seg_id not in include_segments:
+        return False
+    return True
+
+
+def file_passes_filter(file_path: str, input_dir: str,
+                       include_videos: Optional[list],
+                       include_segments: Optional[list]) -> bool:
+    """
+    Determine if a file should be included in the zip based on video/segment filters.
+
+    Expected layout: <input_dir>/<video_name>/<seg_name>/...
+    or              <input_dir>/<video_name>/<file>       (e.g., video.SRT at video level)
+    Files at the top-level (directly in input_dir) pass only if no filters are set.
+    """
+    if include_videos is None and include_segments is None:
+        return True
+
+    rel = os.path.relpath(file_path, input_dir)
+    parts = rel.split(os.sep)
+
+    # Top-level files (like progress.json) - only include if no filters
+    if len(parts) < 2:
+        return False
+
+    video_name = parts[0]
+
+    # Video-level files (e.g., SRT directly under video_name/)
+    if len(parts) == 2:
+        # Include video-level files if video is in include_videos (or nothing set)
+        # but NOT if only specific segments were requested and no videos
+        if include_videos is None and include_segments is not None:
+            # User specified segments only — include SRT for videos that have segments in list
+            video_has_seg = any(s.startswith(f"{video_name}/") for s in include_segments)
+            return video_has_seg
+        if include_videos is not None and video_name not in include_videos:
+            return False
+        return True
+
+    # Segment-level files
+    seg_name = parts[1]
+    return segment_passes_filter(video_name, seg_name, include_videos, include_segments)
+
+
+def compute_dataset_stats(input_dir: str,
+                          include_videos: Optional[list] = None,
+                          include_segments: Optional[list] = None) -> dict:
     """
     Walk the results directory and compute comprehensive dataset statistics
-    from all available metadata files.
+    from all available metadata files. Optionally filtered to specific
+    videos or segments.
     """
     videos = set()
     segments = []
@@ -147,6 +215,18 @@ def compute_dataset_stats(input_dir: str) -> dict:
 
     video_segment_counts = collections.Counter()
 
+    # Per-video aggregations
+    per_video = collections.defaultdict(lambda: {
+        "num_segments": 0,
+        "total_frames": 0,
+        "kitti_bboxes": 0,
+        "kitti_labeled_frames": 0,
+        "classes": collections.Counter(),
+        "sam3_objects": 0,
+        "vggt_tracks": 0,
+        "segments": [],
+    })
+
     for root, dirs, files in os.walk(input_dir):
         if "sam3_masks" in root or "vggt_results" in root:
             continue
@@ -161,6 +241,11 @@ def compute_dataset_stats(input_dir: str) -> dict:
         seg_name = os.path.basename(root)
         video_dir = os.path.dirname(root)
         video_name = os.path.basename(video_dir)
+
+        # Apply include filters
+        if not segment_passes_filter(video_name, seg_name, include_videos, include_segments):
+            continue
+
         videos.add(video_name)
         video_segment_counts[video_name] += 1
 
@@ -231,6 +316,23 @@ def compute_dataset_stats(input_dir: str) -> dict:
         kitti_class_counts += cls_counts
         seg_info["kitti_detections"] = dets
         seg_info["kitti_labeled_frames"] = labeled_frames
+        seg_info["kitti_classes"] = dict(cls_counts)
+
+        # Per-video aggregation
+        pv = per_video[video_name]
+        pv["num_segments"] += 1
+        pv["total_frames"] += num_frames
+        pv["kitti_bboxes"] += dets
+        pv["kitti_labeled_frames"] += labeled_frames
+        pv["classes"] += cls_counts
+        pv["sam3_objects"] += seg_info.get("sam3_objects", 0)
+        pv["vggt_tracks"] += seg_info.get("vggt_tracks", 0)
+        pv["segments"].append({
+            "seg": seg_name,
+            "num_frames": num_frames,
+            "kitti_bboxes": dets,
+            "kitti_labeled_frames": labeled_frames,
+        })
 
         segments.append(seg_info)
 
@@ -285,6 +387,20 @@ def compute_dataset_stats(input_dir: str) -> dict:
             "labels_per_frame": round(kitti_total_detections / max(kitti_frames_with_labels, 1), 2),
             "classes": dict(kitti_class_counts.most_common()),
             "num_classes": len(kitti_class_counts),
+        },
+        "per_video": {
+            vname: {
+                "num_segments": pv["num_segments"],
+                "total_frames": pv["total_frames"],
+                "kitti_bboxes": pv["kitti_bboxes"],
+                "kitti_labeled_frames": pv["kitti_labeled_frames"],
+                "bboxes_per_labeled_frame": round(pv["kitti_bboxes"] / max(pv["kitti_labeled_frames"], 1), 2),
+                "classes": dict(pv["classes"].most_common()),
+                "sam3_objects": pv["sam3_objects"],
+                "vggt_tracks": pv["vggt_tracks"],
+                "segments": pv["segments"],
+            }
+            for vname, pv in sorted(per_video.items())
         },
         "per_segment": segments,
     }
@@ -344,6 +460,18 @@ def print_stats(summary: dict):
     print(f"  Labeled frames:    {ki['frames_with_labels']:,}")
     print(f"  Labels/frame:      {ki['labels_per_frame']}")
     print(f"  Classes ({ki['num_classes']}):       {ki['classes']}")
+
+    pv = summary.get("per_video", {})
+    if pv:
+        print(f"\n  Per-Video Breakdown")
+        print(f"  {'─'*60}")
+        for vname, v in pv.items():
+            cls_str = ", ".join(f"{k}={n}" for k, n in v["classes"].items()) or "none"
+            print(f"  {vname}")
+            print(f"    segments={v['num_segments']}, frames={v['total_frames']:,}, "
+                  f"bboxes={v['kitti_bboxes']:,}, labeled_frames={v['kitti_labeled_frames']:,}, "
+                  f"bboxes/frame={v['bboxes_per_labeled_frame']}")
+            print(f"    classes: {cls_str}")
     print(f"{'='*60}\n")
 
 
@@ -359,10 +487,19 @@ def main():
         print(f"Input directory not found: {input_dir}")
         sys.exit(1)
 
+    include_videos = args.include_video
+    include_segments = args.include_segment
+    if include_videos or include_segments:
+        print(f"Filters: videos={include_videos}, segments={include_segments}")
+
     # --- Stats ---
     if args.stats or args.stats_only:
         print(f"Computing dataset statistics for {input_dir}...")
-        summary = compute_dataset_stats(input_dir)
+        summary = compute_dataset_stats(
+            input_dir,
+            include_videos=include_videos,
+            include_segments=include_segments,
+        )
         print_stats(summary)
 
         if args.output_zip:
@@ -383,20 +520,31 @@ def main():
 
     total_files = 0
     excluded_files = 0
+    filtered_files = 0
     total_size = 0
 
     for root, dirs, files in os.walk(input_dir):
         for f in files:
+            fpath = os.path.join(root, f)
             if should_exclude(f, args.exclude, args.include_predictions):
                 excluded_files += 1
-            else:
-                total_files += 1
-                total_size += os.path.getsize(os.path.join(root, f))
+                continue
+            if not file_passes_filter(fpath, input_dir, include_videos, include_segments):
+                filtered_files += 1
+                continue
+            total_files += 1
+            total_size += os.path.getsize(fpath)
 
     print(f"\nInput: {input_dir}")
     print(f"Files to zip: {total_files} ({total_size / (1024*1024):.1f} MB)")
     if excluded_files:
-        print(f"Files excluded: {excluded_files}")
+        print(f"Files excluded (patterns):  {excluded_files}")
+    if filtered_files:
+        print(f"Files excluded (filters):   {filtered_files}")
+
+    if total_files == 0:
+        print("No files match the filters. Exiting.")
+        sys.exit(1)
 
     print(f"\nCreating {args.output_zip}...")
     os.makedirs(os.path.dirname(os.path.abspath(args.output_zip)), exist_ok=True)
@@ -405,11 +553,13 @@ def main():
     with zipfile.ZipFile(args.output_zip, "w", zipfile.ZIP_DEFLATED) as zf:
         for root, dirs, files in os.walk(input_dir):
             for f in files:
+                fpath = os.path.join(root, f)
                 if should_exclude(f, args.exclude, args.include_predictions):
                     continue
-                file_path = os.path.join(root, f)
-                arcname = os.path.relpath(file_path, input_dir)
-                zf.write(file_path, arcname)
+                if not file_passes_filter(fpath, input_dir, include_videos, include_segments):
+                    continue
+                arcname = os.path.relpath(fpath, input_dir)
+                zf.write(fpath, arcname)
                 zipped += 1
                 if zipped % 500 == 0:
                     print(f"  {zipped}/{total_files} files...")
