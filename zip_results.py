@@ -133,43 +133,81 @@ def segment_passes_filter(video_name: str, seg_name: str,
     return True
 
 
-def file_passes_filter(file_path: str, input_dir: str,
-                       include_videos: Optional[list],
-                       include_segments: Optional[list]) -> bool:
+def discover_segment_paths(input_dir: str) -> list:
     """
-    Determine if a file should be included in the zip based on video/segment filters.
+    Walk input_dir to find all valid segment directories.
+    Returns list of (video_name, seg_name, seg_abs_path, video_abs_path) tuples.
+    Works at any depth — uses metadata.json + frame_numbers as the identifier.
+    """
+    found = []
+    for root, dirs, files in os.walk(input_dir):
+        if "sam3_masks" in root or "vggt_results" in root:
+            continue
+        if "metadata.json" not in files:
+            continue
+        meta = load_json_safe(os.path.join(root, "metadata.json"))
+        if not meta or "frame_numbers" not in meta:
+            continue
+        seg_abs = os.path.abspath(root)
+        video_abs = os.path.dirname(seg_abs)
+        found.append((
+            os.path.basename(video_abs),
+            os.path.basename(seg_abs),
+            seg_abs,
+            video_abs,
+        ))
+    return found
 
-    Expected layout: <input_dir>/<video_name>/<seg_name>/...
-    or              <input_dir>/<video_name>/<file>       (e.g., video.SRT at video level)
-    Files at the top-level (directly in input_dir) pass only if no filters are set.
+
+def build_included_paths(input_dir: str,
+                         include_videos: Optional[list],
+                         include_segments: Optional[list]) -> tuple:
+    """
+    Build the set of absolute paths (segment dirs + video dirs for SRT/etc.)
+    that should be included based on filters.
+
+    Returns (included_seg_dirs, included_video_dirs) as two sets of absolute paths.
     """
     if include_videos is None and include_segments is None:
+        return None, None  # no filtering
+
+    all_segs = discover_segment_paths(input_dir)
+    included_segs = set()
+    included_videos = set()
+
+    for video_name, seg_name, seg_abs, video_abs in all_segs:
+        if segment_passes_filter(video_name, seg_name, include_videos, include_segments):
+            included_segs.add(seg_abs)
+            included_videos.add(video_abs)
+
+    return included_segs, included_videos
+
+
+def file_passes_filter(file_path: str,
+                       included_seg_dirs: Optional[set],
+                       included_video_dirs: Optional[set]) -> bool:
+    """
+    Determine if a file should be included based on pre-computed passing directories.
+    - If included_seg_dirs is None, no filter is active → include everything.
+    - Otherwise include if the file is inside a passing segment directory, or is a
+      direct child of a passing video directory (video-level files like SRT).
+    """
+    if included_seg_dirs is None:
         return True
 
-    rel = os.path.relpath(file_path, input_dir)
-    parts = rel.split(os.sep)
+    fpath_abs = os.path.abspath(file_path)
+    parent = os.path.dirname(fpath_abs)
 
-    # Top-level files (like progress.json) - only include if no filters
-    if len(parts) < 2:
-        return False
+    # Inside a passing segment directory?
+    for seg_dir in included_seg_dirs:
+        if fpath_abs.startswith(seg_dir + os.sep) or parent == seg_dir:
+            return True
 
-    video_name = parts[0]
-
-    # Video-level files (e.g., SRT directly under video_name/)
-    if len(parts) == 2:
-        # Include video-level files if video is in include_videos (or nothing set)
-        # but NOT if only specific segments were requested and no videos
-        if include_videos is None and include_segments is not None:
-            # User specified segments only — include SRT for videos that have segments in list
-            video_has_seg = any(s.startswith(f"{video_name}/") for s in include_segments)
-            return video_has_seg
-        if include_videos is not None and video_name not in include_videos:
-            return False
+    # Video-level file (e.g., SRT directly in the video dir)?
+    if parent in included_video_dirs:
         return True
 
-    # Segment-level files
-    seg_name = parts[1]
-    return segment_passes_filter(video_name, seg_name, include_videos, include_segments)
+    return False
 
 
 def compute_dataset_stats(input_dir: str,
@@ -518,6 +556,14 @@ def main():
         print("No --output-zip specified and not --stats-only. Nothing to do.")
         sys.exit(1)
 
+    # Build the set of passing dirs up front (depth-agnostic)
+    included_seg_dirs, included_video_dirs = build_included_paths(
+        input_dir, include_videos, include_segments
+    )
+    if included_seg_dirs is not None:
+        print(f"Matched {len(included_seg_dirs)} segment(s) in "
+              f"{len(included_video_dirs)} video dir(s) for zipping")
+
     total_files = 0
     excluded_files = 0
     filtered_files = 0
@@ -529,7 +575,7 @@ def main():
             if should_exclude(f, args.exclude, args.include_predictions):
                 excluded_files += 1
                 continue
-            if not file_passes_filter(fpath, input_dir, include_videos, include_segments):
+            if not file_passes_filter(fpath, included_seg_dirs, included_video_dirs):
                 filtered_files += 1
                 continue
             total_files += 1
@@ -556,7 +602,7 @@ def main():
                 fpath = os.path.join(root, f)
                 if should_exclude(f, args.exclude, args.include_predictions):
                     continue
-                if not file_passes_filter(fpath, input_dir, include_videos, include_segments):
+                if not file_passes_filter(fpath, included_seg_dirs, included_video_dirs):
                     continue
                 arcname = os.path.relpath(fpath, input_dir)
                 zf.write(fpath, arcname)
