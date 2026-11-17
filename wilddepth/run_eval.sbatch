@@ -9,8 +9,10 @@
 
 # 4 shards = 16 GB of one A40. The script caps itself at that amount, so it can never use
 # GPU memory reserved by other jobs. It uses only the GPU slurm assigns.
-source ~/.bashrc
-conda activate /storage2/3DOM/vshukla/envs/vggt
+# Load conda directly: ~/.bashrc does nothing in a non-interactive batch job.
+source /opt/miniforge3/etc/profile.d/conda.sh
+conda activate /storage2/3DOM/vshukla/envs/vggt || { echo "conda activate failed"; exit 1; }
+echo "python: $(which python)  job=$SLURM_JOB_ID  gpu=$CUDA_VISIBLE_DEVICES"
 export HF_HOME=/storage3/3DOM/vshukla/hf_cache
 cd /storage2/3DOM/vshukla/repos/vggt/wilddepth
 
