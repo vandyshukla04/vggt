@@ -102,19 +102,20 @@ def read_depth(p: Path, scale: float) -> np.ndarray:
 
 # ----------------------------------------------------------------------------- pairing
 def find_sequences(root: Path, rgb_glob: str, depth_glob: str):
-    """Pair RGB and depth files by filename stem, grouped by the RGB file's sequence dir.
+    """Pair RGB and depth files by filename stem within one sequence.
 
-    The sequence dir is the first path component under root, which matches the
-    one-folder-per-snippet layout of the WildDepth releases.
+    The sequence is the folder that contains the modality folder, e.g.
+    July08/graffe_3 for July08/graffe_3/rgb/91540.jpg, so snippets recorded on the same
+    day stay separate.
     """
     rgb = sorted(root.glob(rgb_glob))
     dep = {}
     for p in root.glob(depth_glob):
-        seq = p.relative_to(root).parts[0]
+        seq = p.relative_to(root).parent.parent.as_posix()
         dep[(seq, p.stem)] = p
     seqs = defaultdict(list)
     for p in rgb:
-        seq = p.relative_to(root).parts[0]
+        seq = p.relative_to(root).parent.parent.as_posix()
         q = dep.get((seq, p.stem))
         if q is not None:
             seqs[seq].append((p, q))
@@ -272,7 +273,7 @@ def main():
     e.add_argument("--rgb_glob", required=True, help='e.g. "*/rgb/*.jpg", relative to --root')
     e.add_argument("--depth_glob", required=True, help='e.g. "*/depth/*.png"; paired by file stem')
     e.add_argument("--depth_scale", type=float, required=True, help="raw value -> metres")
-    e.add_argument("--sequences", default="", help="comma-separated subset of sequence folders")
+    e.add_argument("--sequences", default="", help="comma-separated subset, e.g. July08/graffe_3")
     e.add_argument("--window", type=int, default=24, help="frames per VGGT forward pass")
     e.add_argument("--frame_stride", type=int, default=1, help="use every k-th paired frame")
     e.add_argument("--max_frames", type=int, default=0, help="cap per sequence (0 = all)")
