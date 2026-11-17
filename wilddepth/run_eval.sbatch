@@ -1,10 +1,12 @@
 #!/bin/bash
 #SBATCH --job-name=vggt-wilddepth
 #SBATCH --partition=gpu-A40
-#SBATCH --gres=shard:1        # cluster policy: request shards, not whole GPUs; override with sbatch --gres=shard:N
-#SBATCH --mem=32768           # MB, as the cluster docs require
+#SBATCH --gres=shard:1
+#SBATCH --mem=32768
 #SBATCH --time=12:00:00
 #SBATCH --output=wilddepth_%j.out
+# Cluster policy: request GPU shards (override with sbatch --gres=shard:N), --mem in MB,
+# and never set CUDA_VISIBLE_DEVICES by hand.
 # Set these four after running `inspect`:
 ROOT=${ROOT:-/storage3/3DOM/vshukla/data/WildDepth/longleat_v2_part2}
 RGB_GLOB=${RGB_GLOB:?set from inspect}
