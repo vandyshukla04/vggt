@@ -11,7 +11,7 @@ RGB_GLOB=${RGB_GLOB:?set from inspect}
 DEPTH_GLOB=${DEPTH_GLOB:?set from inspect}
 DEPTH_SCALE=${DEPTH_SCALE:?set from inspect}
 
-source ~/.bashrc && conda activate vggt
+source ~/.bashrc && conda activate ${ENV:-/storage2/3DOM/vshukla/envs/vggt}
 cd "$(dirname "$0")" && mkdir -p logs
 python eval_vggt_wilddepth.py eval --root "$ROOT" \
     --rgb_glob "$RGB_GLOB" --depth_glob "$DEPTH_GLOB" --depth_scale "$DEPTH_SCALE" \
