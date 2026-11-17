@@ -182,8 +182,25 @@ def cmd_eval(a):
     print(f"{len(seqs)} sequences, {sum(len(v) for v in seqs.values())} paired frames")
 
     dev = "cuda"
+    # Shared-GPU safety. Slurm shards reserve GPU memory but do not enforce it, so cap this
+    # process at the reserved amount: going over raises OutOfMemoryError here instead of
+    # pushing other jobs on the same card out of memory.
+    total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
+    if a.gpu_mem_gb <= 0:
+        sys.exit("--gpu_mem_gb is required: set it to (shards requested) x 4 GB.")
+    budget_gb = a.gpu_mem_gb - 1.0          # ~1 GB for the CUDA context, outside the allocator
+    torch.cuda.set_per_process_memory_fraction(min(1.0, budget_gb / total_gb), 0)
+    print(f"GPU {torch.cuda.get_device_name(0)} {total_gb:.1f} GB; this job is capped at "
+          f"{budget_gb:.1f} GB of allocations ({a.gpu_mem_gb} GB reserved)")
+
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-    model = VGGT.from_pretrained("facebook/VGGT-1B").to(dev).eval()
+    model = VGGT.from_pretrained("facebook/VGGT-1B")
+    # Only the depth head is evaluated. The heads are independent, so dropping the others
+    # changes no depth value; it frees their weights and their fp32 activations.
+    model.camera_head = model.point_head = model.track_head = None
+    model = model.to(dev).eval()
+    torch.cuda.reset_peak_memory_stats()
+    peak_gb = 0.0
 
     pooled = {"frame": ([], []), "window": ([], [])}
     per_seq = {}
@@ -198,10 +215,17 @@ def cmd_eval(a):
             if len(win) < 2:
                 continue
             imgs = load_and_preprocess_images([str(p) for p, _ in win], mode="crop").to(dev)
-            with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
-                pr = model(imgs[None])
+            try:
+                with torch.no_grad(), torch.autocast("cuda", dtype=dtype):
+                    pr = model(imgs[None])
+            except torch.OutOfMemoryError:
+                sys.exit(f"Out of memory within this job's {budget_gb:.1f} GB cap at window "
+                         f"{len(win)}. Lower --window or request more shards. Other jobs on "
+                         f"the GPU were not affected.")
             depth = pr["depth"][0, ..., 0].float().cpu().numpy()          # (S, h, w)
             conf = pr["depth_conf"][0].float().cpu().numpy()
+            del pr, imgs
+            peak_gb = max(peak_gb, torch.cuda.max_memory_allocated() / 2**30)
 
             win_pred, win_gt = [], []
             for k, (rp, dp) in enumerate(win):
@@ -245,18 +269,21 @@ def cmd_eval(a):
         f = res.get("window", {})
         print(f"  {seq:<40s} frames={len(pairs):5d}  "
               f"AbsRel={f.get('abs_rel', float('nan')):.3f}  RMSE={f.get('rmse', float('nan')):.2f}  "
-              f"d1={f.get('d1', float('nan')):.3f}  ({time.time() - t0:.0f}s)", flush=True)
+              f"d1={f.get('d1', float('nan')):.3f}  peak={peak_gb:.1f}GB  ({time.time() - t0:.0f}s)",
+              flush=True)
 
     overall = {m: metrics(np.concatenate(P), np.concatenate(G))
                for m, (P, G) in pooled.items() if G}
-    report = {"config": vars(a), "overall": overall, "per_sequence": per_seq}
+    report = {"config": vars(a), "gpu_peak_gb": round(peak_gb, 2),
+              "overall": overall, "per_sequence": per_seq}
     (out / "metrics.json").write_text(json.dumps(report, indent=1))
     print("\nOverall (pixels pooled over all sequences)")
     print(f"{'alignment':<8s} {'n':>10s} {'AbsRel':>7s} {'RMSE':>6s} {'SILog':>6s} {'d1':>6s} {'d2':>6s} {'d3':>6s}")
     for m, r in overall.items():
         print(f"{m:<8s} {r['n']:>10d} {r['abs_rel']:7.3f} {r['rmse']:6.2f} {r['silog']:6.3f} "
               f"{r['d1']:6.3f} {r['d2']:6.3f} {r['d3']:6.3f}")
-    print(f"\nwrote {out / 'metrics.json'}")
+    print(f"\nPeak GPU allocation: {peak_gb:.1f} GB of the {budget_gb:.1f} GB cap")
+    print(f"wrote {out / 'metrics.json'}")
 
 
 def main():
@@ -280,6 +307,8 @@ def main():
     e.add_argument("--min_depth", type=float, default=0.1)
     e.add_argument("--max_depth", type=float, default=0.0, help="0 = no cap")
     e.add_argument("--min_points", type=int, default=20, help="skip frames with fewer LiDAR px")
+    e.add_argument("--gpu_mem_gb", type=float, default=0.0,
+                   help="GPU memory reserved for this job (shards x 4 GB); the process is capped to it")
     e.add_argument("--conf_pct", type=float, default=0.0,
                    help="drop pixels below this percentile of VGGT depth confidence (0 = keep all)")
     a = ap.parse_args()
