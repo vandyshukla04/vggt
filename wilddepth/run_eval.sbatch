@@ -16,7 +16,7 @@ echo "python: $(which python)  job=$SLURM_JOB_ID  gpu=$CUDA_VISIBLE_DEVICES"
 export HF_HOME=/storage3/3DOM/vshukla/hf_cache
 cd /storage2/3DOM/vshukla/repos/vggt/wilddepth
 
-python eval_vggt_wilddepth.py eval \
+python -u eval_vggt_wilddepth.py eval \
     --root /storage3/3DOM/vshukla/data/WildDepth/longleat_v2_part2 \
     --rgb_glob "*/*/rgb/*.jpg" --depth_glob "*/*/depthm/*.png" --depth_scale 0.001 \
     --window 24 --gpu_mem_gb 16 \
