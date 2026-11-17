@@ -150,20 +150,51 @@ def sample_pred(pred: np.ndarray, us: np.ndarray, vs: np.ndarray, W: int, H: int
 
 
 # ----------------------------------------------------------------------------- metrics
+class Stats:
+    """Running sums for every metric, so memory stays constant however many pixels are seen.
+
+    All reported metrics are means of per-pixel terms (SILog uses the mean and the mean
+    square of the log ratio), so pooling sums is exact.
+    """
+    KEYS = ("n", "abs_rel", "sq_err", "ld", "ld2", "d1", "d2", "d3")
+
+    def __init__(self):
+        self.s = dict.fromkeys(self.KEYS, 0.0)
+
+    def add(self, pred: np.ndarray, gt: np.ndarray) -> None:
+        r = np.maximum(pred / gt, gt / pred)
+        ld = np.log(pred) - np.log(gt)
+        self.s["n"] += gt.size
+        self.s["abs_rel"] += float(np.sum(np.abs(pred - gt) / gt))
+        self.s["sq_err"] += float(np.sum((pred - gt) ** 2))
+        self.s["ld"] += float(np.sum(ld))
+        self.s["ld2"] += float(np.sum(ld ** 2))
+        for k, t in (("d1", 1.25), ("d2", 1.25 ** 2), ("d3", 1.25 ** 3)):
+            self.s[k] += float(np.sum(r < t))
+
+    def merge(self, other: "Stats") -> None:
+        for k in self.KEYS:
+            self.s[k] += other.s[k]
+
+    def result(self) -> dict:
+        n = self.s["n"]
+        if n == 0:
+            return {}
+        m_ld = self.s["ld"] / n
+        return {
+            "n": int(n),
+            "abs_rel": self.s["abs_rel"] / n,
+            "rmse": float(np.sqrt(self.s["sq_err"] / n)),
+            "silog": float(np.sqrt(max(self.s["ld2"] / n - m_ld ** 2, 0.0))),
+            "d1": self.s["d1"] / n, "d2": self.s["d2"] / n, "d3": self.s["d3"] / n,
+        }
+
+
 def metrics(pred: np.ndarray, gt: np.ndarray) -> dict:
-    if gt.size == 0:
-        return {}
-    r = np.maximum(pred / gt, gt / pred)
-    ld = np.log(pred) - np.log(gt)
-    return {
-        "n": int(gt.size),
-        "abs_rel": float(np.mean(np.abs(pred - gt) / gt)),
-        "rmse": float(np.sqrt(np.mean((pred - gt) ** 2))),
-        "silog": float(np.sqrt(max(np.mean(ld ** 2) - np.mean(ld) ** 2, 0.0))),
-        "d1": float(np.mean(r < 1.25)),
-        "d2": float(np.mean(r < 1.25 ** 2)),
-        "d3": float(np.mean(r < 1.25 ** 3)),
-    }
+    st = Stats()
+    if gt.size:
+        st.add(pred, gt)
+    return st.result()
 
 
 # ----------------------------------------------------------------------------- eval
@@ -202,15 +233,19 @@ def cmd_eval(a):
     torch.cuda.reset_peak_memory_stats()
     peak_gb = 0.0
 
-    pooled = {"frame": ([], []), "window": ([], [])}
+    MODES = ("frame", "window")
+    pooled = {m: Stats() for m in MODES}
     per_seq = {}
     for seq, pairs in seqs.items():
         pairs = pairs[:: a.frame_stride]
         if a.max_frames:
             pairs = pairs[: a.max_frames]
-        acc = {"frame": ([], []), "window": ([], [])}
+        acc = {m: Stats() for m in MODES}
         t0 = time.time()
-        for w0 in range(0, len(pairs), a.window):
+        n_win = (len(pairs) + a.window - 1) // a.window
+        for wi, w0 in enumerate(range(0, len(pairs), a.window)):
+            if wi and wi % 50 == 0:
+                print(f"    {seq}: {w0}/{len(pairs)} frames ({time.time() - t0:.0f}s)", flush=True)
             win = pairs[w0: w0 + a.window]
             if len(win) < 2:
                 continue
@@ -248,23 +283,17 @@ def cmd_eval(a):
                 if g.size < a.min_points:
                     continue
                 s = np.median(g) / np.median(p)
-                acc["frame"][0].append(p * s)
-                acc["frame"][1].append(g)
+                acc["frame"].add(p * s, g)
                 win_pred.append(p)
                 win_gt.append(g)
             if win_gt:
                 P, G = np.concatenate(win_pred), np.concatenate(win_gt)
                 s = np.median(G) / np.median(P)
-                acc["window"][0].append(P * s)
-                acc["window"][1].append(G)
+                acc["window"].add(P * s, G)
 
-        res = {}
-        for mode, (P, G) in acc.items():
-            if G:
-                P, G = np.concatenate(P), np.concatenate(G)
-                res[mode] = metrics(P, G)
-                pooled[mode][0].append(P)
-                pooled[mode][1].append(G)
+        res = {m: acc[m].result() for m in MODES if acc[m].s["n"]}
+        for m in MODES:
+            pooled[m].merge(acc[m])
         per_seq[seq] = res
         f = res.get("window", {})
         print(f"  {seq:<40s} frames={len(pairs):5d}  "
@@ -272,15 +301,25 @@ def cmd_eval(a):
               f"d1={f.get('d1', float('nan')):.3f}  peak={peak_gb:.1f}GB  ({time.time() - t0:.0f}s)",
               flush=True)
 
-    overall = {m: metrics(np.concatenate(P), np.concatenate(G))
-               for m, (P, G) in pooled.items() if G}
+    overall = {m: pooled[m].result() for m in MODES if pooled[m].s["n"]}
+    # Mean over sequences: each snippet counts once, however many frames it has.
+    macro = {}
+    for m in MODES:
+        rs = [r[m] for r in per_seq.values() if m in r]
+        if rs:
+            macro[m] = {k: float(np.mean([r[k] for r in rs])) for k in rs[0] if k != "n"}
+            macro[m]["n_sequences"] = len(rs)
     report = {"config": vars(a), "gpu_peak_gb": round(peak_gb, 2),
-              "overall": overall, "per_sequence": per_seq}
+              "overall": overall, "mean_over_sequences": macro, "per_sequence": per_seq}
     (out / "metrics.json").write_text(json.dumps(report, indent=1))
     print("\nOverall (pixels pooled over all sequences)")
     print(f"{'alignment':<8s} {'n':>10s} {'AbsRel':>7s} {'RMSE':>6s} {'SILog':>6s} {'d1':>6s} {'d2':>6s} {'d3':>6s}")
     for m, r in overall.items():
         print(f"{m:<8s} {r['n']:>10d} {r['abs_rel']:7.3f} {r['rmse']:6.2f} {r['silog']:6.3f} "
+              f"{r['d1']:6.3f} {r['d2']:6.3f} {r['d3']:6.3f}")
+    print("\nMean over sequences (each snippet weighted equally)")
+    for m, r in macro.items():
+        print(f"{m:<8s} {r['n_sequences']:>10d} {r['abs_rel']:7.3f} {r['rmse']:6.2f} {r['silog']:6.3f} "
               f"{r['d1']:6.3f} {r['d2']:6.3f} {r['d3']:6.3f}")
     print(f"\nPeak GPU allocation: {peak_gb:.1f} GB of the {budget_gb:.1f} GB cap")
     print(f"wrote {out / 'metrics.json'}")
