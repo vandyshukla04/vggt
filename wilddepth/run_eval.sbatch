@@ -1,8 +1,8 @@
 #!/bin/bash
 #SBATCH --job-name=vggt-wilddepth
 #SBATCH --partition=gpu-A40
-#SBATCH --gres=gpu:1
-#SBATCH --mem=48G
+#SBATCH --gres=shard:1        # cluster policy: request shards, not whole GPUs; override with sbatch --gres=shard:N
+#SBATCH --mem=32768           # MB, as the cluster docs require
 #SBATCH --time=12:00:00
 #SBATCH --output=wilddepth_%j.out
 # Set these four after running `inspect`:
@@ -14,6 +14,7 @@ DEPTH_SCALE=${DEPTH_SCALE:?set from inspect}
 source ~/.bashrc && conda activate ${ENV:-/storage2/3DOM/vshukla/envs/vggt}
 export HF_HOME=${HF_HOME:-/storage3/3DOM/vshukla/hf_cache}
 cd "${SLURM_SUBMIT_DIR:-$(pwd)}"   # submit from wilddepth/; slurm runs a spooled copy of this file
+echo "job=$SLURM_JOB_ID gpus=$CUDA_VISIBLE_DEVICES node=$(hostname)"   # never set CUDA_VISIBLE_DEVICES by hand
 python eval_vggt_wilddepth.py eval --root "$ROOT" \
     --rgb_glob "$RGB_GLOB" --depth_glob "$DEPTH_GLOB" --depth_scale "$DEPTH_SCALE" \
     --window ${WINDOW:-24} --frame_stride ${STRIDE:-1} ${EXTRA:-} \
