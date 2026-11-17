@@ -17,7 +17,7 @@ grep -E '\.(tar|zip|tar\.gz)\s' files.txt | while read -r key size url; do
 done
 
 for t in *.tar; do
-    echo "== $t (first 40 entries)"; tar tf "$t" | head -40
-    tar xf "$t"
+    echo "== $t (first 40 entries)"; tar tf "$t" | head -40 || true   # head closes the pipe early
+    tar xf "$t" && echo "extracted $t"
 done
 echo "done: $DATA/$NAME"
