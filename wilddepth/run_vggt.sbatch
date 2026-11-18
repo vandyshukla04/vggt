@@ -1,7 +1,7 @@
 #!/bin/bash
 # VGGT over every clip list in clips/. Resumable: rerun after adding releases.   sbatch run_vggt.sbatch
 #SBATCH --job-name=wd-vggt
-#SBATCH --partition=gpu-A40,gpu-L40S-open
+#SBATCH --partition=gpu-A40
 #SBATCH --gres=shard:8
 #SBATCH --mem=32768
 #SBATCH --time=12:00:00
