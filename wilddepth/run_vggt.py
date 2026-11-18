@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
-"""VGGT runner: one prediction file per clip, in the common format (see wdcommon.py).
+"""VGGT and PAGE-4D runner: one prediction file per clip, in the common format (see wdcommon.py).
 
-  python run_vggt.py --clips clips/longleat_v2_part2.json --preds_dir preds --gpu_mem_gb 32
+  python run_vggt.py --method vggt   --clips clips/*.json --preds_dir preds --gpu_mem_gb 32
+  python run_vggt.py --method page4d --repo /storage2/.../repos/PAGE4D --ckpt .../checkpoint_nomask.pt \
+      --clips clips/*.json --preds_dir preds --gpu_mem_gb 32
 
-Resumable: clips whose prediction file exists are skipped. The process caps its own GPU
-allocations at --gpu_mem_gb minus 1 GB, so it can never use memory reserved by other jobs.
+PAGE-4D is VGGT retrained for dynamic scenes; it keeps VGGT's preprocessing and output format,
+so both share this runner. Resumable: clips whose prediction file exists are skipped. The process
+caps its own GPU allocations at --gpu_mem_gb minus 1 GB, so it can never use memory reserved by
+other jobs.
 """
 from __future__ import annotations
 
@@ -20,12 +24,14 @@ sys.path.insert(0, str(REPO))
 
 from wdcommon import load_clips, pred_path, vggt_crop_geometry  # noqa: E402
 
-METHOD = "vggt"
-METRIC = False          # VGGT depth is normalised per scene; it does not claim metric scale
+METRIC = False          # VGGT and PAGE-4D depth is normalised per scene; neither claims metric scale
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--method", default="vggt", choices=["vggt", "page4d"])
+    ap.add_argument("--repo", default="", help="page4d: PAGE4D repository root")
+    ap.add_argument("--ckpt", default="", help="page4d: checkpoint_nomask.pt")
     ap.add_argument("--clips", nargs="+", required=True)
     ap.add_argument("--preds_dir", default="preds")
     ap.add_argument("--gpu_mem_gb", type=float, required=True, help="shards x 4 GB")
@@ -36,8 +42,15 @@ def main():
     a = ap.parse_args()
 
     import torch
-    from vggt.models.vggt import VGGT
-    from vggt.utils.load_fn import load_and_preprocess_images
+    if a.method == "page4d":
+        if not (a.repo and a.ckpt):
+            sys.exit("--method page4d needs --repo and --ckpt")
+        sys.path.insert(0, str(Path(a.repo) / "model"))
+        from page.models.vggt import VGGT
+        from page.utils.load_fn import load_and_preprocess_images   # identical to VGGT's
+    else:
+        from vggt.models.vggt import VGGT
+        from vggt.utils.load_fn import load_and_preprocess_images
 
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
     budget_gb = a.gpu_mem_gb - 1.0
@@ -45,7 +58,16 @@ def main():
     print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB", flush=True)
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
-    model = VGGT.from_pretrained(a.model)
+    if a.method == "page4d":
+        model = VGGT()
+        state = torch.load(a.ckpt, map_location="cpu", mmap=True, weights_only=False)   # 6.4 GB file
+        state = state.get("model", state)
+        missing, unexpected = model.load_state_dict(state, strict=False)
+        print(f"page4d checkpoint: {len(state)} tensors, {len(missing)} missing, {len(unexpected)} unexpected", flush=True)
+        if any(k.startswith(("aggregator", "depth_head")) for k in missing):
+            sys.exit("page4d checkpoint does not cover the aggregator/depth head: " + str(missing[:5]))
+    else:
+        model = VGGT.from_pretrained(a.model)
     model.camera_head = model.point_head = model.track_head = None      # depth only
     if a.weights == "half":
         model.aggregator = model.aggregator.to(dtype)   # the depth head runs in fp32 either way
@@ -56,7 +78,7 @@ def main():
         C = load_clips(cpath)
         root, release = C["root"], C["release"]
         for clip in C["clips"]:
-            out = pred_path(a.preds_dir, METHOD, release, clip["id"])
+            out = pred_path(a.preds_dir, a.method, release, clip["id"])
             if out.is_file():
                 continue
             if a.limit and done >= a.limit:
