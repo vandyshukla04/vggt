@@ -42,10 +42,13 @@ fi
 
 echo "== 4/5 RoPE CUDA kernels, for CUT3R and TTT3R"
 command -v nvcc >/dev/null 2>&1 || module load cuda/12.4      # 12.x nvcc builds against the cu121 torch (minor-version warning only)
-export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-"8.6"}    # A40; needed when no GPU is visible at build time
+# nvcc 12.4 accepts gcc 13 at most and the nodes ship gcc 14, so build with a gcc 13 from conda.
+conda install -y -c conda-forge "gcc_linux-64=13" "gxx_linux-64=13" > /dev/null
+export CC="$ENV/bin/x86_64-conda-linux-gnu-gcc" CXX="$ENV/bin/x86_64-conda-linux-gnu-g++"
+echo "  host compiler: $("$CC" --version | head -1)"
 for r in CUT3R TTT3R; do
     (cd "$REPOS/$r/src/croco/models/curope" && python setup.py build_ext --inplace > build.log 2>&1) \
-        || { echo "kernel build failed for $r; see $REPOS/$r/src/croco/models/curope/build.log"; exit 1; }
+        || { echo "kernel build failed for $r:"; grep -iE 'error' "$REPOS/$r/src/croco/models/curope/build.log" | head -5; exit 1; }
     (cd "$REPOS/$r/src" && python -c "from croco.models.curope import cuRoPE2D") \
         || { echo "compiled RoPE kernel does not import for $r"; exit 1; }
     echo "  $r: RoPE kernel ok"
