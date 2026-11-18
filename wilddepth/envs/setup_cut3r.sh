@@ -27,7 +27,10 @@ conda install -y 'llvm-openmp<16'
 pip install gdown
 
 echo "== 3/4 checkpoint (3 GB)"
-if [ ! -s "$CKPT/cut3r_512_dpt_4_64.pth" ]; then
+F="$CKPT/cut3r_512_dpt_4_64.pth"
+if [ -f "$F" ] && [ "$(stat -c %s "$F")" -lt 3000000000 ]; then
+    echo "removing incomplete checkpoint ($(stat -c %s "$F") bytes)"; rm -f "$F"; fi
+if [ ! -f "$F" ]; then
     gdown --fuzzy "$GDRIVE" -O "$CKPT/cut3r_512_dpt_4_64.pth" || {
         echo "gdown failed (Google Drive quota). Copy the file from the laptop instead:"
         echo "  scp /home/shuklva/CUT3R/src/cut3r_512_dpt_4_64.pth fbk-cluster:$CKPT/"
