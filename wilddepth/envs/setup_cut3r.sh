@@ -9,7 +9,7 @@ set -euo pipefail
 ENV=/storage3/3DOM/vshukla/envs/cut3r
 REPOS=/storage3/3DOM/vshukla/repos
 CKPT=/storage3/3DOM/vshukla/checkpoints/cut3r
-GDRIVE="https://drive.google.com/file/d/1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD/view?usp=drive_link"
+GDRIVE_ID="1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD"      # cut3r_512_dpt_4_64.pth, from the CUT3R README
 
 source /opt/miniforge3/etc/profile.d/conda.sh
 mkdir -p "$REPOS" "$CKPT"
@@ -31,8 +31,8 @@ F="$CKPT/cut3r_512_dpt_4_64.pth"
 if [ -f "$F" ] && [ "$(stat -c %s "$F")" -lt 3000000000 ]; then
     echo "removing incomplete checkpoint ($(stat -c %s "$F") bytes)"; rm -f "$F"; fi
 if [ ! -f "$F" ]; then
-    gdown --fuzzy "$GDRIVE" -O "$CKPT/cut3r_512_dpt_4_64.pth" || {
-        echo "gdown failed (Google Drive quota). Copy the file from the laptop instead:"
+    gdown "$GDRIVE_ID" -O "$F" || {
+        echo "gdown could not fetch the checkpoint (see its message above). Copy the file from the laptop instead:"
         echo "  scp /home/shuklva/CUT3R/src/cut3r_512_dpt_4_64.pth fbk-cluster:$CKPT/"
         exit 1; }
 fi
