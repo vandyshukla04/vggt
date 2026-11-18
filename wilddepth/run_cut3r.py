@@ -8,7 +8,7 @@
 Both methods load the same checkpoint. TTT3R is the CUT3R code with a different state-update
 rule, switched on through the model config; the TTT3R repository implements both rules.
 Depth is the z of each frame's point map in its own camera frame (pts3d_in_self_view).
-Resumable; the process caps its own GPU allocations at --gpu_mem_gb minus 1 GB.
+Resumable; the process caps its own GPU allocations at what the slurm job reserved, minus 1 GB.
 """
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from wdcommon import load_clips, pred_path  # noqa: E402
+from wdcommon import gpu_budget_gb, load_clips, pred_path  # noqa: E402
 
 METRIC = True           # CUT3R is trained with metric supervision and claims metric-scale output
 
@@ -47,7 +47,8 @@ def main():
     ap.add_argument("--ckpt", required=True, help="cut3r_512_dpt_4_64.pth")
     ap.add_argument("--clips", nargs="+", required=True)
     ap.add_argument("--preds_dir", default="preds")
-    ap.add_argument("--gpu_mem_gb", type=float, required=True, help="shards x 4 GB")
+    ap.add_argument("--gpu_mem_gb", type=float, default=0.0,
+                    help="GPU memory reserved for this job; default: read the shards from slurm")
     ap.add_argument("--size", type=int, default=512)
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
@@ -59,9 +60,9 @@ def main():
     from dust3r.utils.image import load_images
 
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-    budget_gb = a.gpu_mem_gb - 1.0
+    budget_gb, source = gpu_budget_gb(a.gpu_mem_gb)
     torch.cuda.set_per_process_memory_fraction(min(1.0, budget_gb / total_gb), 0)
-    print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB", flush=True)
+    print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB ({source})", flush=True)
 
     model = ARCroco3DStereo.from_pretrained(a.ckpt).cuda().eval()
     if a.method == "ttt3r":

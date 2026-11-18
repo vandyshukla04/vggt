@@ -190,3 +190,39 @@ class Stats:
                 "rmse": float(np.sqrt(self.s["sq_err"] / n)),
                 "silog": float(np.sqrt(max(self.s["ld2"] / n - m_ld ** 2, 0.0))),
                 "d1": self.s["d1"] / n, "d2": self.s["d2"] / n, "d3": self.s["d3"] / n}
+
+
+# ----------------------------------------------------------------------------- GPU budget
+def gpu_budget_gb(requested: float = 0.0, shard_gb: float = 4.0) -> tuple[float, str]:
+    """GPU memory this process may allocate, and where the figure came from.
+
+    Order: an explicit --gpu_mem_gb; else the shards or GPUs Slurm granted this job (read from
+    `scontrol show job`, so it always matches --gres); else the whole device (no Slurm). One GB is
+    kept back for the CUDA context, which lives outside the allocator. Nothing here touches
+    CUDA_VISIBLE_DEVICES.
+    """
+    import os
+    import re
+    import subprocess
+    import torch
+
+    total = torch.cuda.get_device_properties(0).total_memory / 2**30
+    if requested > 0:
+        return min(requested, total) - 1.0, f"{requested:.0f} GB given"
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        try:
+            info = subprocess.run(["scontrol", "show", "job", job], capture_output=True, text=True,
+                                  timeout=20).stdout
+        except (OSError, subprocess.SubprocessError):
+            info = ""
+        m = re.search(r"shard(?::[A-Za-z0-9_]+)?[:=](\d+)", info)
+        if m:
+            n = int(m.group(1))
+            return min(n * shard_gb, total) - 1.0, f"{n} shards x {shard_gb:.0f} GB from slurm"
+        m = re.search(r"gpu(?::[A-Za-z0-9_]+)?[:=](\d+)", info)
+        if m:
+            return total - 1.0, "whole GPU from slurm"
+        raise SystemExit("inside a slurm job but no shard/gpu reservation was found in `scontrol show job`; "
+                         "GPU work needs --gres (cluster policy)")
+    return total - 1.0, "no slurm job: whole device"

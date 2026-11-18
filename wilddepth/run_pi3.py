@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """π³ runner: one prediction file per clip, in the common format (see wdcommon.py).
 
-  python run_pi3.py --repo /storage2/.../repos/Pi3 --clips clips/*.json --preds_dir preds --gpu_mem_gb 32
+  python run_pi3.py --repo /storage2/.../repos/Pi3 --clips clips/*.json --preds_dir preds
 
 Preprocessing follows pi3.utils.basic.load_images_as_tensor: every frame is resized (no crop) to the
 largest multiple-of-14 size with at most 255,000 pixels that keeps the aspect ratio, 672x378 for
-1080p. Depth is the z of the per-view local point map. Resumable; GPU allocations capped at
---gpu_mem_gb minus 1 GB.
+1080p. Depth is the z of the per-view local point map. Resumable; GPU allocations capped at what
+the slurm job reserved, minus 1 GB.
 """
 from __future__ import annotations
 
@@ -20,7 +20,7 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
-from wdcommon import load_clips, pred_path  # noqa: E402
+from wdcommon import gpu_budget_gb, load_clips, pred_path  # noqa: E402
 
 METHOD = "pi3"
 METRIC = False          # π³ predicts scale-invariant local point maps
@@ -46,7 +46,8 @@ def main():
     ap.add_argument("--repo", required=True, help="Pi3 repository root")
     ap.add_argument("--clips", nargs="+", required=True)
     ap.add_argument("--preds_dir", default="preds")
-    ap.add_argument("--gpu_mem_gb", type=float, required=True, help="shards x 4 GB")
+    ap.add_argument("--gpu_mem_gb", type=float, default=0.0,
+                    help="GPU memory reserved for this job; default: read the shards from slurm")
     ap.add_argument("--model", default="yyfz233/Pi3")
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--weights", default="fp32", choices=["fp32", "half"],
@@ -60,9 +61,9 @@ def main():
     from pi3.models.pi3 import Pi3
 
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-    budget_gb = a.gpu_mem_gb - 1.0
+    budget_gb, source = gpu_budget_gb(a.gpu_mem_gb)
     torch.cuda.set_per_process_memory_fraction(min(1.0, budget_gb / total_gb), 0)
-    print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB", flush=True)
+    print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB ({source})", flush=True)
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     model = Pi3.from_pretrained(a.model)

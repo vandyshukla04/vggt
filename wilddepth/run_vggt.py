@@ -7,8 +7,8 @@
 
 PAGE-4D is VGGT retrained for dynamic scenes; it keeps VGGT's preprocessing and output format,
 so both share this runner. Resumable: clips whose prediction file exists are skipped. The process
-caps its own GPU allocations at --gpu_mem_gb minus 1 GB, so it can never use memory reserved by
-other jobs.
+caps its own GPU allocations at the memory the slurm job reserved (shards x 4 GB) minus 1 GB, so
+it can never use memory reserved by other jobs.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ import numpy as np
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
-from wdcommon import load_clips, pred_path, vggt_crop_geometry  # noqa: E402
+from wdcommon import gpu_budget_gb, load_clips, pred_path, vggt_crop_geometry  # noqa: E402
 
 METRIC = False          # VGGT and PAGE-4D depth is normalised per scene; neither claims metric scale
 
@@ -34,7 +34,8 @@ def main():
     ap.add_argument("--ckpt", default="", help="page4d: checkpoint_nomask.pt")
     ap.add_argument("--clips", nargs="+", required=True)
     ap.add_argument("--preds_dir", default="preds")
-    ap.add_argument("--gpu_mem_gb", type=float, required=True, help="shards x 4 GB")
+    ap.add_argument("--gpu_mem_gb", type=float, default=0.0,
+                    help="GPU memory reserved for this job; default: read the shards from slurm")
     ap.add_argument("--model", default="facebook/VGGT-1B")
     ap.add_argument("--limit", type=int, default=0, help="stop after this many clips (0 = all)")
     ap.add_argument("--weights", default="fp32", choices=["fp32", "half"],
@@ -53,9 +54,9 @@ def main():
         from vggt.utils.load_fn import load_and_preprocess_images
 
     total_gb = torch.cuda.get_device_properties(0).total_memory / 2**30
-    budget_gb = a.gpu_mem_gb - 1.0
+    budget_gb, source = gpu_budget_gb(a.gpu_mem_gb)
     torch.cuda.set_per_process_memory_fraction(min(1.0, budget_gb / total_gb), 0)
-    print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB", flush=True)
+    print(f"{torch.cuda.get_device_name(0)} {total_gb:.1f} GB; capped at {budget_gb:.1f} GB ({source})", flush=True)
     dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 
     if a.method == "page4d":
