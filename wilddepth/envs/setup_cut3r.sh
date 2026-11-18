@@ -23,6 +23,9 @@ echo "== 2/4 environment"
 conda activate "$ENV"
 pip install torch==2.5.1 torchvision==0.20.1 --index-url https://download.pytorch.org/whl/cu121
 pip install -r "$REPOS/CUT3R/requirements.txt"
+# requirements.txt leaves transformers unpinned and its newest release demands torch >= 2.6;
+# pin the versions of the WildLIFT machine, which work with torch 2.5.1
+pip install "transformers==4.52.4" "huggingface_hub==0.32.4" "accelerate==1.7.0"
 conda install -y 'llvm-openmp<16'
 pip install gdown
 
