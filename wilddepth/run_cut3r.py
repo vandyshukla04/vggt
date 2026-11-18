@@ -55,6 +55,12 @@ def main():
 
     import torch
     sys.path.insert(0, str(Path(a.repo) / "src"))
+    try:
+        from croco.models.curope import cuRoPE2D  # noqa: F401
+    except Exception as e:  # noqa: BLE001
+        sys.exit(f"the compiled RoPE kernel is missing in {a.repo} ({type(e).__name__}). CUT3R's pose token "
+                 f"uses position -1, which the PyTorch fallback cannot index; build the kernel with "
+                 f"envs/setup_cut3r.sh (step 4) and rerun.")
     from dust3r.inference import inference
     from dust3r.model import ARCroco3DStereo
     from dust3r.utils.image import load_images

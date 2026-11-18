@@ -3,8 +3,8 @@
 # login node, inside tmux (it takes 20-40 minutes).      bash envs/setup_cut3r.sh
 #
 # Versions match the machine that produced the WildLIFT results: python 3.11, torch 2.5.1
-# (CUDA 12.1 build), numpy 1.26.4. The RoPE CUDA kernels are not compiled; CUT3R then uses
-# its PyTorch implementation of the same operation.
+# (CUDA 12.1 build), numpy 1.26.4. The RoPE CUDA kernels are compiled (step 4): CUT3R gives its
+# pose token position -1, which the kernel handles and the PyTorch fallback cannot.
 set -euo pipefail
 ENV=/storage3/3DOM/vshukla/envs/cut3r
 REPOS=/storage3/3DOM/vshukla/repos
@@ -40,7 +40,18 @@ if [ ! -f "$F" ]; then
         exit 1; }
 fi
 
-echo "== 4/4 check: import the model and load the weights on the CPU"
+echo "== 4/5 RoPE CUDA kernels, for CUT3R and TTT3R"
+command -v nvcc >/dev/null 2>&1 || module load cuda/12.4      # 12.x nvcc builds against the cu121 torch (minor-version warning only)
+export TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST:-"8.6"}    # A40; needed when no GPU is visible at build time
+for r in CUT3R TTT3R; do
+    (cd "$REPOS/$r/src/croco/models/curope" && python setup.py build_ext --inplace > build.log 2>&1) \
+        || { echo "kernel build failed for $r; see $REPOS/$r/src/croco/models/curope/build.log"; exit 1; }
+    (cd "$REPOS/$r/src" && python -c "from croco.models.curope import cuRoPE2D") \
+        || { echo "compiled RoPE kernel does not import for $r"; exit 1; }
+    echo "  $r: RoPE kernel ok"
+done
+
+echo "== 5/5 check: import the model and load the weights on the CPU"
 cd "$REPOS/CUT3R"
 python - <<'PY'
 import sys, torch
