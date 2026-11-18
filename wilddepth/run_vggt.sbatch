@@ -12,4 +12,5 @@ conda activate /storage2/3DOM/vshukla/envs/vggt || { echo "conda activate failed
 export HF_HOME=/storage3/3DOM/vshukla/hf_cache
 cd /storage2/3DOM/vshukla/repos/vggt/wilddepth
 echo "job=$SLURM_JOB_ID gpu=$CUDA_VISIBLE_DEVICES node=$(hostname) python=$(which python)"
+ls clips/*.json >/dev/null 2>&1 || { echo "no clip lists in clips/: run make_clips.py first"; exit 1; }
 python -u run_vggt.py --clips clips/*.json --preds_dir preds --gpu_mem_gb 32
