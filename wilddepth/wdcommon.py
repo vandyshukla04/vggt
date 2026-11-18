@@ -18,7 +18,7 @@ from __future__ import annotations
 import json
 import re
 from collections import defaultdict
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 import numpy as np
 
@@ -47,25 +47,44 @@ def read_depth(p: Path, scale: float) -> np.ndarray:
     return d * scale
 
 
-def stem_key(p: Path):
+def stem_key(p):
     """Sort frames numerically when the stem is a number (91540.jpg), else by name."""
     s = p.stem
     return (0, int(s)) if s.isdigit() else (1, s)
 
 
-def find_sequences(root: Path, rgb_glob: str, depth_glob: str) -> dict[str, list[tuple[Path, Path]]]:
-    """{sequence: [(rgb, depth), ...]} paired by stem. The sequence is the folder holding the
-    modality folders, e.g. July08/graffe_3 for July08/graffe_3/rgb/91540.jpg."""
-    dep = {}
-    for p in root.glob(depth_glob):
-        dep[(p.relative_to(root).parent.parent.as_posix(), p.stem)] = p
+def _depth_match(rel: str, pattern: str) -> bool:
+    """Match a relative path against a glob with the same component count ('*' never crosses '/')."""
+    parts = PurePosixPath(rel).parts
+    return len(parts) == len(PurePosixPath(pattern).parts) and PurePosixPath(rel).match(pattern)
+
+
+def pair_relative(rel_paths, rgb_glob: str, depth_glob: str) -> dict[str, list[tuple[str, str]]]:
+    """{sequence: [(rgb, depth), ...]} from relative paths (a directory walk or a tar listing),
+    paired by stem and sorted numerically. The sequence is the folder holding the modality
+    folders, e.g. July08/graffe_3 for July08/graffe_3/rgb/91540.jpg."""
+    rgb, dep = [], {}
+    for r in rel_paths:
+        r = r[2:] if r.startswith("./") else r
+        if _depth_match(r, rgb_glob):
+            rgb.append(r)
+        elif _depth_match(r, depth_glob):
+            p = PurePosixPath(r)
+            dep[(p.parent.parent.as_posix(), p.stem)] = r
     seqs = defaultdict(list)
-    for p in sorted(root.glob(rgb_glob), key=stem_key):
-        seq = p.relative_to(root).parent.parent.as_posix()
-        q = dep.get((seq, p.stem))
+    for r in sorted(rgb, key=lambda x: stem_key(PurePosixPath(x))):
+        p = PurePosixPath(r)
+        q = dep.get((p.parent.parent.as_posix(), p.stem))
         if q is not None:
-            seqs[seq].append((p, q))
+            seqs[p.parent.parent.as_posix()].append((r, q))
     return dict(sorted(seqs.items()))
+
+
+def find_sequences(root: Path, rgb_glob: str, depth_glob: str) -> dict[str, list[tuple[Path, Path]]]:
+    """pair_relative over a directory tree, with absolute paths."""
+    rel = [p.relative_to(root).as_posix() for p in Path(root).rglob("*") if p.is_file()]
+    return {seq: [(root / r, root / d) for r, d in pairs]
+            for seq, pairs in pair_relative(rel, rgb_glob, depth_glob).items()}
 
 
 def read_metadata(seq_dir: Path) -> dict:

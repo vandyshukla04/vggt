@@ -2,6 +2,7 @@
 """Fix the evaluation clips for one WildDepth release. Run once; every method uses the result.
 
   python make_clips.py --root /storage3/.../WildDepth/longleat_v2_part2 --out clips/longleat_v2_part2.json
+  python make_clips.py --root <dir> --listing listing.txt --out ...   # from a `tar tf` listing, before extraction
 
 A clip is `clip_len` consecutive synchronised frames (default 96, about 10 s at 10 FPS). Each
 snippet contributes at most `max_clips` clips, evenly spaced, so one long snippet cannot dominate.
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from wdcommon import find_sequences, read_metadata
+from wdcommon import find_sequences, pair_relative, read_metadata
 
 
 def clip_starts(n: int, clip_len: int, max_clips: int) -> list[int]:
@@ -32,6 +33,8 @@ def main():
     ap.add_argument("--root", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--release", default="", help="name; default = basename of --root")
+    ap.add_argument("--listing", default="", help="file with one archive member per line (tar tf); "
+                    "then only metadata.txt and one rgb frame per snippet need to exist under --root")
     ap.add_argument("--rgb_glob", default="*/*/rgb/*.jpg")
     ap.add_argument("--depth_glob", default="*/*/depthm/*.png")
     ap.add_argument("--depth_scale", type=float, default=0.001, help="raw depth value -> metres")
@@ -42,7 +45,12 @@ def main():
 
     root = Path(a.root).resolve()
     release = a.release or root.name
-    seqs = find_sequences(root, a.rgb_glob, a.depth_glob)
+    if a.listing:
+        rel = [ln.strip() for ln in Path(a.listing).read_text().splitlines() if ln.strip() and not ln.endswith("/")]
+        seqs = {seq: [(root / r, root / d) for r, d in pairs]
+                for seq, pairs in pair_relative(rel, a.rgb_glob, a.depth_glob).items()}
+    else:
+        seqs = find_sequences(root, a.rgb_glob, a.depth_glob)
     if not seqs:
         raise SystemExit(f"no rgb/depth pairs under {root} with {a.rgb_glob} / {a.depth_glob}")
 
@@ -53,7 +61,10 @@ def main():
             dropped.append((seq, n))
             continue
         meta = read_metadata(root / seq)
-        with Image.open(pairs[0][0]) as im:
+        first = next((r for r, _ in pairs if r.is_file()), None)
+        if first is None:
+            raise SystemExit(f"{seq}: no rgb frame present under {root} to read the image size from")
+        with Image.open(first) as im:
             W, H = im.size
         for ci, s0 in enumerate(clip_starts(n, a.clip_len, a.max_clips)):
             sel = pairs[s0: s0 + a.clip_len]
