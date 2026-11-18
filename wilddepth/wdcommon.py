@@ -80,9 +80,26 @@ def pair_relative(rel_paths, rgb_glob: str, depth_glob: str) -> dict[str, list[t
     return dict(sorted(seqs.items()))
 
 
+GLOB_CANDIDATES = (("*/*/rgb/*.jpg", "*/*/depthm/*.png"),     # Longleat: <day>/<snippet>/rgb
+                   ("*/rgb/*.jpg", "*/depthm/*.png"),         # Bubye: <snippet>/rgb
+                   ("*/*/*/rgb/*.jpg", "*/*/*/depthm/*.png"))
+
+
+def detect_globs(rel_paths, rgb_glob: str = "auto", depth_glob: str = "auto") -> tuple[str, str]:
+    """Return (rgb_glob, depth_glob): the given ones, or the first candidate layout that pairs."""
+    if rgb_glob != "auto" and depth_glob != "auto":
+        return rgb_glob, depth_glob
+    rel_paths = list(rel_paths)
+    for rg, dg in GLOB_CANDIDATES:
+        if pair_relative(rel_paths, rg, dg):
+            return rg, dg
+    raise SystemExit("no rgb/depth layout recognised; pass --rgb_glob and --depth_glob")
+
+
 def find_sequences(root: Path, rgb_glob: str, depth_glob: str) -> dict[str, list[tuple[Path, Path]]]:
     """pair_relative over a directory tree, with absolute paths."""
     rel = [p.relative_to(root).as_posix() for p in Path(root).rglob("*") if p.is_file()]
+    rgb_glob, depth_glob = detect_globs(rel, rgb_glob, depth_glob)
     return {seq: [(root / r, root / d) for r, d in pairs]
             for seq, pairs in pair_relative(rel, rgb_glob, depth_glob).items()}
 

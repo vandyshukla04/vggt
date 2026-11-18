@@ -48,10 +48,10 @@ echo "$(grep -vc '/$' "$DIR/listing.txt") files in $(( ${#TARS[@]} )) archive(s)
 echo "== 3/5 metadata, calibration, one frame per snippet"
 python3 - "$WD" "$DIR/listing.txt" <<'PY' > "$DIR/.want"
 import sys
-sys.path.insert(0, sys.argv[1]); from wdcommon import pair_relative
+sys.path.insert(0, sys.argv[1]); from wdcommon import detect_globs, pair_relative
 lines = [l.strip() for l in open(sys.argv[2]) if l.strip() and not l.strip().endswith("/")]
-want = [l for l in lines if l.endswith("metadata.txt") or l.startswith("calibration/")]
-want += [pairs[0][0] for pairs in pair_relative(lines, "*/*/rgb/*.jpg", "*/*/depthm/*.png").values()]
+want = [l for l in lines if l.endswith(("metadata.txt", "README.txt")) or l.startswith("calibration/")]
+want += [pairs[0][0] for pairs in pair_relative(lines, *detect_globs(lines)).values()]
 print("\n".join(want))
 PY
 for t in "${TARS[@]}"; do extract_members "$t" "$DIR/.want"; done

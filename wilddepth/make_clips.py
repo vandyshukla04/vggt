@@ -16,7 +16,7 @@ from pathlib import Path
 
 from PIL import Image
 
-from wdcommon import find_sequences, pair_relative, read_metadata
+from wdcommon import detect_globs, find_sequences, pair_relative, read_metadata
 
 
 def clip_starts(n: int, clip_len: int, max_clips: int) -> list[int]:
@@ -35,8 +35,8 @@ def main():
     ap.add_argument("--release", default="", help="name; default = basename of --root")
     ap.add_argument("--listing", default="", help="file with one archive member per line (tar tf); "
                     "then only metadata.txt and one rgb frame per snippet need to exist under --root")
-    ap.add_argument("--rgb_glob", default="*/*/rgb/*.jpg")
-    ap.add_argument("--depth_glob", default="*/*/depthm/*.png")
+    ap.add_argument("--rgb_glob", default="auto", help='e.g. "*/*/rgb/*.jpg"; auto = detect the layout')
+    ap.add_argument("--depth_glob", default="auto")
     ap.add_argument("--depth_scale", type=float, default=0.001, help="raw depth value -> metres")
     ap.add_argument("--clip_len", type=int, default=96)
     ap.add_argument("--max_clips", type=int, default=2)
@@ -47,8 +47,9 @@ def main():
     release = a.release or root.name
     if a.listing:
         rel = [ln.strip() for ln in Path(a.listing).read_text().splitlines() if ln.strip() and not ln.endswith("/")]
+        rg, dg = detect_globs(rel, a.rgb_glob, a.depth_glob)
         seqs = {seq: [(root / r, root / d) for r, d in pairs]
-                for seq, pairs in pair_relative(rel, a.rgb_glob, a.depth_glob).items()}
+                for seq, pairs in pair_relative(rel, rg, dg).items()}
     else:
         seqs = find_sequences(root, a.rgb_glob, a.depth_glob)
     if not seqs:
