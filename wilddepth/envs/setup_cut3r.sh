@@ -6,9 +6,10 @@
 # (CUDA 12.1 build), numpy 1.26.4. The RoPE CUDA kernels are compiled (step 4): CUT3R gives its
 # pose token position -1, which the kernel handles and the PyTorch fallback cannot.
 set -euo pipefail
-ENV=/storage3/3DOM/vshukla/envs/cut3r
-REPOS=/storage3/3DOM/vshukla/repos
-CKPT=/storage3/3DOM/vshukla/checkpoints/cut3r
+ENV=/storage2/3DOM/vshukla/envs/cut3r
+REPOS=/storage2/3DOM/vshukla/repos
+CKPT=/storage2/3DOM/vshukla/checkpoints/cut3r
+export PIP_CACHE_DIR=/storage2/3DOM/vshukla/pip_cache     # keep pip downloads out of /home (group quota nearly full)
 GDRIVE_ID="1Asz-ZB3FfpzZYwunhQvNPZEUA8XUNAYD"      # cut3r_512_dpt_4_64.pth, from the CUT3R README
 
 source /opt/miniforge3/etc/profile.d/conda.sh
@@ -42,9 +43,10 @@ fi
 
 echo "== 4/5 RoPE CUDA kernels, for CUT3R and TTT3R"
 command -v nvcc >/dev/null 2>&1 || module load cuda/12.4      # 12.x nvcc builds against the cu121 torch (minor-version warning only)
-# nvcc 12.4 accepts gcc 13 at most and the nodes ship gcc 14, so build with a gcc 13 from conda.
-conda install -y -c conda-forge "gcc_linux-64=13" "gxx_linux-64=13" > /dev/null
-export CC="$ENV/bin/x86_64-conda-linux-gnu-gcc" CXX="$ENV/bin/x86_64-conda-linux-gnu-g++"
+# nvcc 12.4 accepts gcc 13 at most and the nodes ship gcc 14: use the cluster's gcc/9.3 module.
+# torch passes $CC to nvcc as its host compiler (-ccbin).
+module load gcc/9.3
+export CC="$(command -v gcc)" CXX="$(command -v g++)"
 echo "  host compiler: $("$CC" --version | head -1)"
 for r in CUT3R TTT3R; do
     (cd "$REPOS/$r/src/croco/models/curope" && python setup.py build_ext --inplace > build.log 2>&1) \
@@ -60,7 +62,7 @@ python - <<'PY'
 import sys, torch
 sys.path.insert(0, "src")
 from dust3r.model import ARCroco3DStereo
-m = ARCroco3DStereo.from_pretrained("/storage3/3DOM/vshukla/checkpoints/cut3r/cut3r_512_dpt_4_64.pth")
+m = ARCroco3DStereo.from_pretrained("/storage2/3DOM/vshukla/checkpoints/cut3r/cut3r_512_dpt_4_64.pth")
 n = sum(p.numel() for p in m.parameters()) / 1e6
 print(f"CUT3R ok: {n:.0f}M parameters, torch {torch.__version__}, python {sys.version.split()[0]}")
 PY
