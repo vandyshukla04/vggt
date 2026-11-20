@@ -17,6 +17,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import multiprocessing
+import os
+import time
 from collections import defaultdict
 from pathlib import Path
 
@@ -30,21 +33,30 @@ KEYS = ("abs_rel", "rmse", "silog", "d1", "d2", "d3")
 CI_KEYS = ("clip_abs_rel", "clip_d1", "clip_rmse", "frame_abs_rel", "metric_abs_rel", "drift", "scale_err")
 
 
-def score_clip(clip, root, depth_scale, pred, a):
-    depth = pred["depth"].astype(np.float32)
-    geom = pred["geom"]
-    assert list(pred["frames"]) == [f["stem"] for f in clip["frames"]], f"frame order differs: {clip['id']}"
-    P, G, log_sf = [], [], []
-    for k, f in enumerate(clip["frames"]):
+def load_gt(clip, root, depth_scale, a):
+    """Valid LiDAR pixels of every frame of a clip: [(us, vs, depth_m) or None]. Read once per clip."""
+    out = []
+    for f in clip["frames"]:
         gt = read_depth(root / f["depth"], depth_scale)
         ok = np.isfinite(gt) & (gt > a.min_depth)
         if a.max_depth:
             ok &= gt < a.max_depth
         vs, us = np.nonzero(ok)
-        if us.size < a.min_points:
+        out.append((us, vs, gt[vs, us]) if us.size >= a.min_points else None)
+    return out
+
+
+def score_clip(clip, gt_frames, pred, a):
+    depth = pred["depth"].astype(np.float32)
+    geom = pred["geom"]
+    assert list(pred["frames"]) == [f["stem"] for f in clip["frames"]], f"frame order differs: {clip['id']}"
+    P, G, log_sf = [], [], []
+    for k, fr in enumerate(gt_frames):
+        if fr is None:
             continue
+        us, vs, gv = fr
         p, inside = sample_at(depth[k], us, vs, geom)
-        g = gt[vs[inside], us[inside]]
+        g = gv[inside]
         good = p > 1e-6
         p, g = p[good], g[good]
         if g.size < a.min_points:
@@ -73,6 +85,36 @@ def score_clip(clip, root, depth_scale, pred, a):
     return {"stats": stats, "bins": bins, "metric": metric, "log_sc": log_sc,
             "drift": float(np.std(log_sf)) if len(log_sf) > 1 else float("nan"),
             "n_frames_used": len(log_sf)}
+
+
+def eval_clip(job):
+    """One clip, all methods. Returns {method: None (no prediction) | False (unusable) | result}."""
+    clip, root, depth_scale, release, a = job
+    paths = {m: pred_path(a.preds_dir, m, release, clip["id"]) for m in a.methods}
+    have = {m: p for m, p in paths.items() if p.is_file()}
+    out = {m: None for m in a.methods}
+    if not have:
+        return release, clip, out
+    gt_frames = load_gt(clip, root, depth_scale, a)
+    for m, pp in have.items():
+        pred = np.load(pp)
+        r = score_clip(clip, gt_frames, pred, a)
+        if r is None:
+            out[m] = False
+            continue
+        row = {"release": release, "seq": clip["seq"], "id": clip["id"],
+               "vehicle": clip["meta"].get("vehicle", "?"), "species": clip["meta"].get("species", ""),
+               "n_frames": clip["n_frames"], "n_frames_used": r["n_frames_used"],
+               "drift": r["drift"], "log_scale": r["log_sc"],
+               "scale_err": abs(r["log_sc"]) if r["metric"] else float("nan"),
+               "ms_per_frame": 1e3 * float(pred["forward_s"]) / clip["n_frames"],
+               "peak_gb": float(pred["peak_gb"])}
+        for al in ALIGN:
+            res = r["stats"][al].result()
+            for k in KEYS:
+                row[f"{al}_{k}"] = res.get(k, float("nan"))
+        out[m] = {"row": row, "stats": r["stats"], "bins": r["bins"]}
+    return release, clip, out
 
 
 def mean_of(rows, key):
@@ -112,40 +154,37 @@ def main():
     ap.add_argument("--min_depth", type=float, default=0.1)
     ap.add_argument("--max_depth", type=float, default=0.0, help="0 = no cap")
     ap.add_argument("--min_points", type=int, default=20)
+    ap.add_argument("--workers", type=int, default=0, help="processes; 0 = the CPUs this job may use, at most 8")
     a = ap.parse_args()
 
     clipsets = [load_clips(c) for c in a.clips]
+    jobs = [(clip, C["root"], C["depth_scale"], C["release"], a) for C in clipsets for clip in C["clips"]]
+    acc = {m: {"rows": [], "missing": 0, "pooled": {k: Stats() for k in ALIGN}, "bins": [Stats() for _ in BINS]}
+           for m in a.methods}
+    workers = a.workers or min(8, len(os.sched_getaffinity(0)))
+    print(f"{len(jobs)} clips, {len(a.methods)} methods, {workers} worker process(es); ground truth is read once per clip",
+          flush=True)
+    t0 = time.time()
+    pool = multiprocessing.Pool(workers) if workers > 1 else None
+    results = pool.imap(eval_clip, jobs) if pool else map(eval_clip, jobs)
+    for i, (release, clip, out) in enumerate(results, 1):
+        for m, r in out.items():
+            if r is None:
+                acc[m]["missing"] += 1
+            elif r:
+                acc[m]["rows"].append(r["row"])
+                for al in ALIGN:
+                    acc[m]["pooled"][al].merge(r["stats"][al])
+                for j, b in enumerate(r["bins"]):
+                    acc[m]["bins"][j].merge(b)
+        if i % 10 == 0 or i == len(jobs):
+            print(f"  {i}/{len(jobs)} clips  ({time.time() - t0:.0f}s)", flush=True)
+    if pool:
+        pool.close()
+
     report = {"config": vars(a), "methods": {}}
     for method in a.methods:
-        rows, missing = [], 0
-        pooled = {k: Stats() for k in ALIGN}
-        bins = [Stats() for _ in BINS]
-        for C in clipsets:
-            for clip in C["clips"]:
-                pp = pred_path(a.preds_dir, method, C["release"], clip["id"])
-                if not pp.is_file():
-                    missing += 1
-                    continue
-                pred = np.load(pp)
-                r = score_clip(clip, C["root"], C["depth_scale"], pred, a)
-                if r is None:
-                    continue
-                row = {"release": C["release"], "seq": clip["seq"], "id": clip["id"],
-                       "vehicle": clip["meta"].get("vehicle", "?"),
-                       "species": clip["meta"].get("species", ""),
-                       "n_frames": clip["n_frames"], "n_frames_used": r["n_frames_used"],
-                       "drift": r["drift"], "log_scale": r["log_sc"],
-                       "scale_err": abs(r["log_sc"]) if r["metric"] else float("nan"),
-                       "ms_per_frame": 1e3 * float(pred["forward_s"]) / clip["n_frames"],
-                       "peak_gb": float(pred["peak_gb"])}
-                for al in ALIGN:
-                    res = r["stats"][al].result()
-                    for k in KEYS:
-                        row[f"{al}_{k}"] = res.get(k, float("nan"))
-                    pooled[al].merge(r["stats"][al])
-                for i, b in enumerate(r["bins"]):
-                    bins[i].merge(b)
-                rows.append(row)
+        rows, missing, pooled, bins = (acc[method][k] for k in ("rows", "missing", "pooled", "bins"))
         if not rows:
             print(f"\n== {method}: no predictions under {a.preds_dir}/{method}")
             continue
