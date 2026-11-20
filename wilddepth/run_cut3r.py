@@ -6,8 +6,11 @@
   python run_cut3r.py --method ttt3r --repo /storage3/.../repos/TTT3R --ckpt <same file> ...
 
 Both methods load the same checkpoint. TTT3R is the CUT3R code with a different state-update
-rule, switched on through the model config; the TTT3R repository implements both rules.
+rule, switched on through the model config. Each method runs through the inference routine its
+authors use in their demo and video-depth evaluation: CUT3R `inference`, TTT3R
+`inference_recurrent_lighter` (no state resets within a clip, as in TTT3R's evaluation).
 Depth is the z of each frame's point map in its own camera frame (pts3d_in_self_view).
+The rotary position embedding runs in PyTorch when the compiled kernel is absent (see use_direct_rope).
 Resumable; the process caps its own GPU allocations at what the slurm job reserved, minus 1 GB.
 """
 from __future__ import annotations
@@ -40,6 +43,42 @@ def cut3r_geometry(W: int, H: int, size: int = 512):
     return geom, (int(2 * halfh), int(2 * halfw))
 
 
+def use_direct_rope(model) -> str:
+    """Make the PyTorch RoPE2D usable for CUT3R; returns which implementation the model runs.
+
+    CUT3R's rotary position embedding has a compiled CUDA kernel (cuRoPE2D) and a PyTorch fallback.
+    The fallback looks cos/sin up in a table indexed by position, which fails for the pose token's
+    position -1. Here its forward is replaced by the direct computation the kernel performs
+    (angle = position x inverse frequency), valid for any integer position. Checked against the
+    compiled kernel on full CUT3R runs: depth mean relative difference 7e-5 (STUDY.md, 2026-11-20).
+    """
+    import torch
+
+    def forward(self, tokens, positions):
+        D = tokens.size(3) // 2
+        inv_freq = 1.0 / (self.base ** (torch.arange(0, D, 2, device=tokens.device).float() / D))
+
+        def rope1d(x, pos):
+            ang = pos[:, :, None].float() * inv_freq
+            ang = torch.cat((ang, ang), dim=-1)[:, None]
+            return x * ang.cos().to(x.dtype) + self.rotate_half(x) * ang.sin().to(x.dtype)
+
+        y, x = tokens.chunk(2, dim=-1)
+        return torch.cat((rope1d(y, positions[:, :, 0]), rope1d(x, positions[:, :, 1])), dim=-1)
+
+    classes = {type(m) for m in model.modules() if type(m).__name__ in ("RoPE2D", "cuRoPE2D")}
+    if not classes:
+        sys.exit("no RoPE module found in the model; the position-embedding code has changed")
+    kinds = set()
+    for c in classes:
+        if hasattr(c, "get_cos_sin"):               # the PyTorch fallback class
+            c.forward = forward
+            kinds.add("pytorch-direct")
+        else:
+            kinds.add("compiled-kernel")
+    return "+".join(sorted(kinds))
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--method", required=True, choices=["cut3r", "ttt3r"])
@@ -50,18 +89,21 @@ def main():
     ap.add_argument("--gpu_mem_gb", type=float, default=0.0,
                     help="GPU memory reserved for this job; default: read the shards from slurm")
     ap.add_argument("--size", type=int, default=512)
+    ap.add_argument("--rope", default="auto", choices=["auto", "python"],
+                    help="auto: compiled cuRoPE2D kernel if the repo has it, else PyTorch; python: force PyTorch")
     ap.add_argument("--limit", type=int, default=0)
     a = ap.parse_args()
 
     import torch
     sys.path.insert(0, str(Path(a.repo) / "src"))
-    try:
-        from croco.models.curope import cuRoPE2D  # noqa: F401
-    except Exception as e:  # noqa: BLE001
-        sys.exit(f"the compiled RoPE kernel is missing in {a.repo} ({type(e).__name__}). CUT3R's pose token "
-                 f"uses position -1, which the PyTorch fallback cannot index; build the kernel with "
-                 f"envs/setup_cut3r.sh (step 4) and rerun.")
-    from dust3r.inference import inference
+    if a.rope == "python":
+        sys.modules["models.curope"] = None       # the import of the compiled kernel then fails -> PyTorch RoPE
+    if a.method == "ttt3r":
+        # TTT3R's own demo and video-depth evaluation call this frame-by-frame routine
+        from dust3r.inference import inference_recurrent_lighter as inference
+    else:
+        # CUT3R's demo and video-depth evaluation (and the WildLIFT pipeline) call this one
+        from dust3r.inference import inference
     from dust3r.model import ARCroco3DStereo
     from dust3r.utils.image import load_images
 
@@ -75,7 +117,8 @@ def main():
         model.config.model_update_type = "ttt3r"         # as in the TTT3R demo
     elif hasattr(model.config, "model_update_type"):
         model.config.model_update_type = "cut3r"
-    print(f"{a.method}: {sum(p.numel() for p in model.parameters())/1e6:.0f}M parameters", flush=True)
+    rope = use_direct_rope(model)
+    print(f"{a.method}: {sum(p.numel() for p in model.parameters())/1e6:.0f}M parameters, RoPE: {rope}", flush=True)
 
     done = 0
     for cpath in a.clips:
@@ -118,14 +161,14 @@ def main():
             forward_s = time.time() - t0
             peak_gb = torch.cuda.max_memory_allocated() / 2**30
 
-            depth = np.stack([p["pts3d_in_self_view"][0, ..., 2].float().numpy() for p in outputs["pred"]])
-            conf = np.stack([p["conf_self"][0].float().numpy() for p in outputs["pred"]])
+            depth = np.stack([p["pts3d_in_self_view"][0, ..., 2].float().cpu().numpy() for p in outputs["pred"]])
+            conf = np.stack([p["conf_self"][0].float().cpu().numpy() for p in outputs["pred"]])
             del outputs, views, imgs
             torch.cuda.empty_cache()
             out.parent.mkdir(parents=True, exist_ok=True)
             np.savez(out, depth=depth.astype(np.float16), conf=conf.astype(np.float16), geom=geom,
                      frames=np.array([f["stem"] for f in clip["frames"]]),
-                     metric=METRIC, forward_s=forward_s, load_s=load_s, peak_gb=peak_gb)
+                     metric=METRIC, forward_s=forward_s, load_s=load_s, peak_gb=peak_gb, rope=rope)
             done += 1
             print(f"  {release}/{clip['id']:<28s} {clip['n_frames']:3d} fr  load {load_s:5.1f}s  "
                   f"fwd {forward_s:5.1f}s  peak {peak_gb:4.1f} GB", flush=True)
